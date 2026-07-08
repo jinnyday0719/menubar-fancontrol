@@ -3,6 +3,9 @@ import Foundation
 import ServiceManagement
 
 enum FanCtlHelperClient {
+    static let fanCommandTimeout: TimeInterval = 45.0
+    static let automaticFallbackTimeout: TimeInterval = 5.0
+
     enum Error: LocalizedError {
         case unavailable
         case rejected(String)
@@ -160,31 +163,100 @@ private final class XPCReplyState: @unchecked Sendable {
 }
 
 enum FanCtlHelperInstaller {
+    private static let registeredHelperBuildKey = "registeredFanControlHelperBuild"
+    private static let pendingHelperBuildKey = "pendingFanControlHelperBuild"
+
     static func install() throws {
         let service = SMAppService.daemon(plistName: FanCtlHelperConstants.daemonPlistName)
         switch service.status {
         case .enabled:
-            return
+            try refreshEnabledServiceIfNeeded(service)
         case .requiresApproval:
             throw InstallError.requiresApproval
         case .notRegistered, .notFound:
-            try service.register()
-            if service.status == .requiresApproval {
-                throw InstallError.requiresApproval
-            }
+            try register(service)
         @unknown default:
-            try service.register()
+            try register(service)
         }
+    }
+
+    private static func refreshEnabledServiceIfNeeded(_ service: SMAppService) throws {
+        guard let currentBuild = currentBuildNumber else {
+            return
+        }
+
+        let registeredBuild = UserDefaults.standard.string(forKey: registeredHelperBuildKey)
+        let pendingBuild = UserDefaults.standard.string(forKey: pendingHelperBuildKey)
+
+        if registeredBuild == currentBuild {
+            clearPendingBuild()
+            return
+        }
+
+        if pendingBuild == currentBuild {
+            rememberRegisteredBuild(currentBuild)
+            clearPendingBuild()
+            return
+        }
+
+        rememberRegisteredBuild(currentBuild)
+    }
+
+    private static func register(_ service: SMAppService) throws {
+        try service.register()
+
+        switch service.status {
+        case .enabled:
+            if let currentBuild = currentBuildNumber {
+                rememberRegisteredBuild(currentBuild)
+                clearPendingBuild()
+            }
+        case .requiresApproval:
+            if let currentBuild = currentBuildNumber {
+                rememberPendingBuild(currentBuild)
+            }
+            throw InstallError.requiresApproval
+        case .notRegistered, .notFound:
+            throw InstallError.registrationDidNotStart
+        @unknown default:
+            guard let currentBuild = currentBuildNumber else {
+                return
+            }
+            rememberRegisteredBuild(currentBuild)
+        }
+    }
+
+    private static var currentBuildNumber: String? {
+        guard let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+              !build.isEmpty else {
+            return nil
+        }
+        return build
+    }
+
+    private static func rememberRegisteredBuild(_ build: String) {
+        UserDefaults.standard.set(build, forKey: registeredHelperBuildKey)
+    }
+
+    private static func rememberPendingBuild(_ build: String) {
+        UserDefaults.standard.set(build, forKey: pendingHelperBuildKey)
+    }
+
+    private static func clearPendingBuild() {
+        UserDefaults.standard.removeObject(forKey: pendingHelperBuildKey)
     }
 }
 
 enum InstallError: LocalizedError {
     case requiresApproval
+    case registrationDidNotStart
 
     var errorDescription: String? {
         switch self {
         case .requiresApproval:
             L10n.helperRequiresApproval
+        case .registrationDidNotStart:
+            L10n.helperRegistrationFailed
         }
     }
 }

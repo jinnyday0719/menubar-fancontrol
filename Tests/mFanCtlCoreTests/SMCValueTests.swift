@@ -53,4 +53,58 @@ final class SMCValueTests: XCTestCase {
         let value = SMCValue(key: "F0Md", dataType: "ui8 ", dataSize: 1, bytes: [0])
         XCTAssertEqual(value.numericValue, 0)
     }
+
+    func testManualModeRollsBackToAutomaticWhenRPMWriteFails() {
+        let smc = FakeSMCClient(values: [
+            "F0Mn": SMCValue(key: "F0Mn", dataType: "ui16", dataSize: 2, bytes: [0x07, 0xd0]),
+            "F0Mx": SMCValue(key: "F0Mx", dataType: "ui16", dataSize: 2, bytes: [0x1f, 0x40]),
+            "F0Md": SMCValue(key: "F0Md", dataType: "ui8 ", dataSize: 1, bytes: [0]),
+            "F0Tg": SMCValue(key: "F0Tg", dataType: "fpe2", dataSize: 2, bytes: [0, 0])
+        ])
+        smc.rejectedWriteKeys = ["F0Tg"]
+
+        XCTAssertThrowsError(try FanController(smc: smc).setManual(fanIndex: 0, rpm: 5000))
+        XCTAssertTrue(smc.writes.contains { $0.key == "F0Md" && $0.bytes == [1] })
+        XCTAssertTrue(smc.writes.contains { $0.key == "F0Md" && $0.bytes == [0] })
+    }
+}
+
+private final class FakeSMCClient: SMCClient, @unchecked Sendable {
+    enum Error: Swift.Error {
+        case rejectedWrite(String)
+    }
+
+    var rejectedWriteKeys = Set<String>()
+    private(set) var writes: [(key: String, bytes: [UInt8])] = []
+    private var values: [String: SMCValue]
+
+    init(values: [String: SMCValue]) {
+        self.values = values
+    }
+
+    func read(_ key: String) throws -> SMCValue {
+        guard let value = values[key] else {
+            throw SMCError.invalidKey(key)
+        }
+        return value
+    }
+
+    func numericValue(for key: String) -> Double? {
+        try? read(key).numericValue
+    }
+
+    func write(_ key: String, bytes: [UInt8]) throws {
+        writes.append((key, bytes))
+        if rejectedWriteKeys.contains(key) {
+            throw Error.rejectedWrite(key)
+        }
+
+        let existing = try? read(key)
+        values[key] = SMCValue(
+            key: key,
+            dataType: existing?.dataType ?? "ui8 ",
+            dataSize: existing?.dataSize ?? UInt32(bytes.count),
+            bytes: bytes
+        )
+    }
 }

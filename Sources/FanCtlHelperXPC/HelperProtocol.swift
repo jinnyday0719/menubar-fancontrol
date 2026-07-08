@@ -1,11 +1,12 @@
 import Foundation
 
 public enum FanCtlHelperConstants {
+    public static let appName = "mFanCtl"
+    public static let appExecutableName = "mFanCtl"
     public static let machServiceName = "io.github.jinnyday0719.mfanctl.FanControlHelper"
     public static let daemonPlistName = "\(machServiceName).plist"
     public static let helperExecutableName = "mFanCtlFanHelper"
     public static let appBundleIdentifier = "io.github.jinnyday0719.mfanctl"
-    public static let developerTeamIdentifier = "93BTXAM95W"
 }
 
 @objc(MFanCtlHelperXPCProtocol)

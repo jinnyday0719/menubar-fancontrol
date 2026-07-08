@@ -90,7 +90,7 @@ enum L10n {
     static var cancel: String { text("취소", "Cancel") }
     static var launchAtLoginSection: String { text("  자동 실행", "  Auto Launch") }
     static var launchAtLoginSetting: String { text("로그인 시 mFanCtl을 자동 실행", "Open mFanCtl at login") }
-    static var checkForUpdatesAtLaunch: String { text("앱 시작할 때 업데이트 확인", "Check for updates at launch") }
+    static var checkForUpdatesAtLaunch: String { text("앱 시작 시 GitHub 릴리즈 확인", "Check GitHub Releases at launch") }
     static var languageSection: String { text("  언어", "  Language") }
     static var appLanguage: String { text("앱 언어", "App language") }
     static var menuBarDisplaySection: String { text("  메뉴바 표시", "  Menu Bar Display") }
@@ -105,6 +105,7 @@ enum L10n {
     static var noFansFound: String { text("팬을 찾을 수 없습니다.", "No fans found.") }
     static var missingPreset: String { text("사전 설정을 찾을 수 없습니다.", "Preset not found.") }
     static var helperUnavailable: String { text("팬 제어 helper가 설치되어 있지 않습니다.", "Fan control helper is not installed.") }
+    static var helperRegistrationFailed: String { text("팬 제어 helper를 등록하지 못했습니다.", "Could not register the fan control helper.") }
     static var invalidHelperResponse: String { text("helper 응답이 올바르지 않습니다.", "Invalid helper response.") }
     static var helperApprovalPromptTitle: String { text("백그라운드 앱 허용", "Allow Background App") }
     static var helperApprovalPromptMessage: String {
@@ -287,6 +288,9 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
     private var settingsWindowController: FanCtlSettingsWindowController?
     private var createPresetWindowController: FanCtlCreatePresetWindowController?
     private var isShowingFanHelperApprovalPrompt = false
+    private var isRestoringAutomaticBeforeTermination = false
+    private var lidStateTimer: Timer?
+    private var wasLidClosed = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installMainMenu()
@@ -297,6 +301,7 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
             name: .fanCtlLanguageDidChange,
             object: nil
         )
+        installAutomaticFallbackObservers()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem?.menu = menu
@@ -324,6 +329,27 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
                 self.checkForUpdates(presentsNoUpdate: false)
             }
         }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !isRestoringAutomaticBeforeTermination else {
+            return .terminateNow
+        }
+
+        isRestoringAutomaticBeforeTermination = true
+        Task { [model] in
+            await model.restoreAutomaticForAppTermination()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        lidStateTimer?.invalidate()
+        model.invalidateTimers()
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        DistributedNotificationCenter.default().removeObserver(self)
+        NotificationCenter.default.removeObserver(self)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -454,6 +480,74 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
         centerWindowOnActiveScreen(alert.window)
         alert.window.orderFrontRegardless()
         return alert.runModal()
+    }
+
+    private func installAutomaticFallbackObservers() {
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(systemShouldRestoreAutomaticFanMode(_:)),
+            name: NSWorkspace.willSleepNotification,
+            object: nil
+        )
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(systemShouldRestoreAutomaticFanMode(_:)),
+            name: NSWorkspace.screensDidSleepNotification,
+            object: nil
+        )
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(systemShouldRestoreAutomaticFanMode(_:)),
+            name: NSWorkspace.sessionDidResignActiveNotification,
+            object: nil
+        )
+
+        let distributedCenter = DistributedNotificationCenter.default()
+        distributedCenter.addObserver(
+            self,
+            selector: #selector(systemShouldRestoreAutomaticFanMode(_:)),
+            name: Notification.Name("com.apple.screenIsLocked"),
+            object: nil
+        )
+        distributedCenter.addObserver(
+            self,
+            selector: #selector(systemShouldRestoreAutomaticFanMode(_:)),
+            name: Notification.Name("com.apple.screensaver.didstart"),
+            object: nil
+        )
+
+        if let isLidClosed = LidStateReader.isLidClosed() {
+            wasLidClosed = isLidClosed
+            if isLidClosed {
+                model.applyAutomaticForSleepOrLidClose()
+            }
+        }
+
+        let timer = Timer(
+            timeInterval: 2,
+            target: self,
+            selector: #selector(lidStateTimerDidFire),
+            userInfo: nil,
+            repeats: true
+        )
+        lidStateTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    @objc private func systemShouldRestoreAutomaticFanMode(_ notification: Notification) {
+        model.applyAutomaticForSleepOrLidClose()
+    }
+
+    @objc private func lidStateTimerDidFire() {
+        guard let isLidClosed = LidStateReader.isLidClosed() else {
+            return
+        }
+
+        if isLidClosed && !wasLidClosed {
+            model.applyAutomaticForSleepOrLidClose()
+        }
+        wasLidClosed = isLidClosed
     }
 
     private func buildMenu() {
@@ -2482,6 +2576,11 @@ final class FanCtlMenuBarModel: NSObject {
         refreshHelperState()
     }
 
+    func invalidateTimers() {
+        timer?.invalidate()
+        timer = nil
+    }
+
     func prepareHelper() {
         prepareHelperSilently()
     }
@@ -2500,6 +2599,31 @@ final class FanCtlMenuBarModel: NSObject {
 
     func applyPresetSelection(_ preset: FanPreset) {
         applyPreset(preset)
+    }
+
+    func applyAutomaticForSleepOrLidClose() {
+        Task {
+            await restoreAutomatic(reason: "sleep or lid close")
+        }
+    }
+
+    func restoreAutomaticForAppTermination() async {
+        await restoreAutomatic(reason: "app termination")
+    }
+
+    private func restoreAutomatic(reason: String) async {
+        do {
+            _ = try await FanCtlHelperClient.send(
+                "SET_AUTOMATIC",
+                timeout: FanCtlHelperClient.automaticFallbackTimeout
+            )
+            helperState = .available
+            requiresHelperApproval = false
+            errorMessage = nil
+            selectedPreset = .automatic
+        } catch {
+            NSLog("mFanCtl failed to restore automatic fan mode for \(reason): \(error.localizedDescription)")
+        }
     }
 
     @discardableResult
@@ -2728,7 +2852,7 @@ final class FanCtlMenuBarModel: NSObject {
         if waitForAvailability {
             try await FanCtlHelperClient.waitUntilAvailable(timeout: 2.0)
         }
-        _ = try await FanCtlHelperClient.send(command)
+        _ = try await FanCtlHelperClient.send(command, timeout: FanCtlHelperClient.fanCommandTimeout)
     }
 
     private func installHelper(thenApply preset: FanPreset? = nil) {

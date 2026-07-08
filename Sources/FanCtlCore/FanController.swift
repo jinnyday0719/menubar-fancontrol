@@ -13,9 +13,9 @@ public struct FanControlResult: Sendable {
 }
 
 public final class FanController: Sendable {
-    private let smc: SMCConnection
+    private let smc: any SMCClient
 
-    public init(smc: SMCConnection) {
+    public init(smc: any SMCClient) {
         self.smc = smc
     }
 
@@ -28,7 +28,12 @@ public final class FanController: Sendable {
         let maximum = smc.numericValue(for: "F\(fanIndex)Mx") ?? requestedRPM
         let appliedRPM = min(max(requestedRPM, minimum), maximum)
         let strategy = try enableManualMode(fanIndex: fanIndex)
-        try writeRPM(fanIndex: fanIndex, rpm: appliedRPM)
+        do {
+            try writeRPM(fanIndex: fanIndex, rpm: appliedRPM)
+        } catch {
+            try? setAutomatic(fanIndex: fanIndex)
+            throw error
+        }
 
         return FanControlResult(
             fanIndex: fanIndex,

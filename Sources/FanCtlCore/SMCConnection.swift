@@ -40,6 +40,12 @@ private enum SMCCommand: UInt8 {
     case readKeyInfo = 9
 }
 
+public protocol SMCClient: Sendable {
+    func read(_ key: String) throws -> SMCValue
+    func numericValue(for key: String) -> Double?
+    func write(_ key: String, bytes: [UInt8]) throws
+}
+
 private typealias SMCBytes = (
     UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
     UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
@@ -87,7 +93,7 @@ private struct SMCKeyData {
     )
 }
 
-public final class SMCConnection: @unchecked Sendable {
+public final class SMCConnection: SMCClient, @unchecked Sendable {
     public let serviceName: String
     public static let parameterStructSize = MemoryLayout<SMCKeyData>.stride
     private let connection: io_connect_t
@@ -150,6 +156,9 @@ public final class SMCConnection: @unchecked Sendable {
         guard result == kIOReturnSuccess else {
             throw SMCError.readFailed(key: key, result)
         }
+        guard output.result == 0 else {
+            throw SMCError.firmwareRejected(key: key, output.result)
+        }
 
         let keyInfo = output.keyInfo
         input.keyInfo.dataSize = keyInfo.dataSize
@@ -158,6 +167,9 @@ public final class SMCConnection: @unchecked Sendable {
         result = call(input: &input, output: &output)
         guard result == kIOReturnSuccess else {
             throw SMCError.readFailed(key: key, result)
+        }
+        guard output.result == 0 else {
+            throw SMCError.firmwareRejected(key: key, output.result)
         }
 
         return SMCValue(

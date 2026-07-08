@@ -23,6 +23,7 @@ supported.
 - Create custom fan presets
 - Customize the menu bar display format
 - Optional launch at login
+- Optional GitHub Releases update check at launch, enabled by default
 
 ## Installation
 
@@ -30,6 +31,8 @@ Download the latest DMG from the Releases page, open it, and drag `mFanCtl.app`
 to Applications.
 
 When fan control is enabled, macOS may ask you to allow the fan control helper.
+If update checks are enabled, mFanCtl contacts the GitHub Releases API at launch
+to compare the latest released version.
 
 ## Notes
 

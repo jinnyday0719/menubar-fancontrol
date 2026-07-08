@@ -27,6 +27,7 @@ let package = Package(
             dependencies: ["FanCtlCore", "FanCtlHelperXPC"],
             linkerSettings: [
                 .linkedFramework("AppKit"),
+                .linkedFramework("IOKit"),
                 .linkedFramework("ServiceManagement")
             ]
         ),

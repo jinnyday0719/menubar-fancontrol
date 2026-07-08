@@ -94,11 +94,11 @@ private final class FanCtlHelperDelegate: NSObject, NSXPCListenerDelegate {
 }
 
 private enum ConnectionAuthorizer {
-    private static let requirementText = """
-    identifier "\(FanCtlHelperConstants.appBundleIdentifier)" and anchor apple generic and certificate leaf[subject.OU] = "\(FanCtlHelperConstants.developerTeamIdentifier)"
-    """
-
     static func isAuthorized(pid: pid_t) -> Bool {
+        guard let requirementText = appRequirementTextSignedByCurrentTeam() else {
+            return false
+        }
+
         var code: SecCode?
         let attributes = [kSecGuestAttributePid as String: NSNumber(value: pid)] as CFDictionary
         guard SecCodeCopyGuestWithAttributes(nil, attributes, SecCSFlags(), &code) == errSecSuccess,
@@ -113,6 +113,41 @@ private enum ConnectionAuthorizer {
         }
 
         return SecCodeCheckValidity(code, SecCSFlags(), requirement) == errSecSuccess
+    }
+
+    private static func appRequirementTextSignedByCurrentTeam() -> String? {
+        guard let teamIdentifier = currentCodeTeamIdentifier() else {
+            return nil
+        }
+
+        return """
+        identifier "\(FanCtlHelperConstants.appBundleIdentifier)" and anchor apple generic and certificate leaf[subject.OU] = "\(teamIdentifier)"
+        """
+    }
+
+    private static func currentCodeTeamIdentifier() -> String? {
+        var code: SecCode?
+        guard SecCodeCopySelf(SecCSFlags(), &code) == errSecSuccess,
+              let code else {
+            return nil
+        }
+
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, SecCSFlags(), &staticCode) == errSecSuccess,
+              let staticCode else {
+            return nil
+        }
+
+        var information: CFDictionary?
+        let flags = SecCSFlags(rawValue: kSecCSSigningInformation)
+        guard SecCodeCopySigningInformation(staticCode, flags, &information) == errSecSuccess,
+              let dictionary = information as? [String: Any],
+              let teamIdentifier = dictionary[kSecCodeInfoTeamIdentifier as String] as? String,
+              !teamIdentifier.isEmpty else {
+            return nil
+        }
+
+        return teamIdentifier
     }
 }
 

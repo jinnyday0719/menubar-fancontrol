@@ -2,16 +2,31 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_NAME="mFanCtl"
-BUNDLE_ID="io.github.jinnyday0719.mfanctl"
-HELPER_ID="io.github.jinnyday0719.mfanctl.FanControlHelper"
+IDENTITY_SOURCE="$ROOT/Sources/FanCtlHelperXPC/HelperProtocol.swift"
+
+read_swift_constant() {
+    local name="$1"
+    local value
+    value="$(sed -n "s/^[[:space:]]*public static let $name = \"\\(.*\\)\"[[:space:]]*$/\\1/p" "$IDENTITY_SOURCE" | head -n 1)"
+    if [[ -z "$value" ]]; then
+        echo "Could not read Swift constant: $name" >&2
+        exit 1
+    fi
+    printf '%s\n' "$value"
+}
+
+APP_NAME="$(read_swift_constant appName)"
+APP_EXECUTABLE="$(read_swift_constant appExecutableName)"
+BUNDLE_ID="$(read_swift_constant appBundleIdentifier)"
+HELPER_ID="$(read_swift_constant machServiceName)"
+HELPER_EXECUTABLE="$(read_swift_constant helperExecutableName)"
 APP="$ROOT/.build/$APP_NAME.app"
-HELPER="$APP/Contents/Library/LaunchServices/mFanCtlFanHelper"
+HELPER="$APP/Contents/Library/LaunchServices/$HELPER_EXECUTABLE"
 DIST="$ROOT/dist"
 DMG_ROOT="$DIST/dmg-root"
 
-APP_VERSION="${APP_VERSION:-0.1.0}"
-BUILD_NUMBER="${BUILD_NUMBER:-1}"
+APP_VERSION="${APP_VERSION:-}"
+BUILD_NUMBER="${BUILD_NUMBER:-}"
 IDENTITY="${DEVELOPER_ID_APPLICATION:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
 NOTARIZE=0
@@ -24,8 +39,8 @@ Options:
   --identity NAME          Developer ID Application identity.
   --notarize              Submit the DMG to Apple's notary service.
   --notary-profile NAME   notarytool keychain profile name.
-  --version VERSION       CFBundleShortVersionString. Default: $APP_VERSION
-  --build NUMBER          CFBundleVersion. Default: $BUILD_NUMBER
+  --version VERSION       CFBundleShortVersionString. Required.
+  --build NUMBER          CFBundleVersion. Required.
 
 Environment:
   DEVELOPER_ID_APPLICATION  Same as --identity.
@@ -68,6 +83,16 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ -z "$APP_VERSION" || -z "$BUILD_NUMBER" ]]; then
+    cat >&2 <<EOF
+Missing release version or build number.
+
+Run:
+  scripts/package-release.sh --version VERSION --build NUMBER
+EOF
+    exit 2
+fi
 
 detect_identity() {
     security find-identity -v -p codesigning |
