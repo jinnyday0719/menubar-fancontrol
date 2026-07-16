@@ -104,8 +104,8 @@ enum L10n {
     static var installingPermission: String { text("팬 제어 준비 중...", "Preparing fan control...") }
     static var applyingFanPreset: String {
         text(
-            "팬 제어 전환 중...",
-            "Switching fan control..."
+            "팬 모드 전환 중...",
+            "Switching fan mode..."
         )
     }
     static var fanPresetFailedAndRestoredAutomatic: String {
