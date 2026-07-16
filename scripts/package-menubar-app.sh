@@ -7,7 +7,7 @@ IDENTITY_SOURCE="$ROOT/Sources/FanCtlHelperXPC/HelperProtocol.swift"
 read_swift_constant() {
     local name="$1"
     local value
-    value="$(sed -n "s/^[[:space:]]*public static let $name = \"\\(.*\\)\"[[:space:]]*$/\\1/p" "$IDENTITY_SOURCE" | head -n 1)"
+    value="$(sed -n "s/^[[:space:]]*public static let $name = \"\\(.*\\)\"[[:space:]]*$/\\1/p" "$IDENTITY_SOURCE" | sed -n '1p')"
     if [[ -z "$value" ]]; then
         echo "Could not read Swift constant: $name" >&2
         exit 1
@@ -23,15 +23,75 @@ HELPER_EXECUTABLE="$(read_swift_constant helperExecutableName)"
 
 APP="$ROOT/.build/$APP_NAME.app"
 BUILD_CONFIGURATION="${BUILD_CONFIGURATION:-debug}"
+PACKAGING_MODE="${PACKAGING_MODE:-development}"
 BIN="$ROOT/.build/$BUILD_CONFIGURATION/mfanctl-menubar"
 HELPER_BIN="$ROOT/.build/$BUILD_CONFIGURATION/mfanctl-helper"
-APP_VERSION="${APP_VERSION:-0.0.0-dev}"
+APP_VERSION="${APP_VERSION:-0.0.0}"
 BUILD_NUMBER="${BUILD_NUMBER:-0}"
+
+case "$BUILD_CONFIGURATION" in
+    debug|release) ;;
+    *)
+        echo "Unsupported BUILD_CONFIGURATION: $BUILD_CONFIGURATION (expected debug or release)" >&2
+        exit 2
+        ;;
+esac
+
+case "$PACKAGING_MODE" in
+    development|release) ;;
+    *)
+        echo "Unsupported PACKAGING_MODE: $PACKAGING_MODE (expected development or release)" >&2
+        exit 2
+        ;;
+esac
+
+if [[ ! "$APP_VERSION" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]; then
+    echo "Invalid APP_VERSION: $APP_VERSION" >&2
+    exit 2
+fi
+
+if [[ ! "$BUILD_NUMBER" =~ ^[0-9]+$ ]]; then
+    echo "Invalid BUILD_NUMBER: $BUILD_NUMBER" >&2
+    exit 2
+fi
+
+if [[ "$PACKAGING_MODE" == "release" ]]; then
+    if [[ "$BUILD_CONFIGURATION" != "release" ]]; then
+        echo "Release packaging requires BUILD_CONFIGURATION=release." >&2
+        exit 2
+    fi
+    if [[ "$BUILD_NUMBER" == "0" ]]; then
+        echo "Release packaging requires a numeric release version and a positive build number." >&2
+        exit 2
+    fi
+else
+    cat >&2 <<EOF
+Creating an unsigned development bundle.
+This output supports UI/sensor testing only; privileged fan control requires a signed build.
+Use scripts/package-release.sh for distribution.
+EOF
+fi
+
+for required_file in \
+    "$ROOT/Resources/AppIcon.png" \
+    "$ROOT/Resources/AppIcon.icns" \
+    "$ROOT/LICENSE"; do
+    if [[ ! -f "$required_file" ]]; then
+        echo "Required packaging input is missing: $required_file" >&2
+        exit 1
+    fi
+done
 
 cd "$ROOT"
 swift build -c "$BUILD_CONFIGURATION" --product mfanctl-menubar
 swift build -c "$BUILD_CONFIGURATION" --product mfanctl-helper
-"$ROOT/scripts/generate-app-icon.sh" >/dev/null
+
+for executable in "$BIN" "$HELPER_BIN"; do
+    if [[ ! -f "$executable" || ! -x "$executable" ]]; then
+        echo "Expected executable was not produced: $executable" >&2
+        exit 1
+    fi
+done
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
@@ -44,6 +104,7 @@ cp "$HELPER_BIN" "$APP/Contents/Library/LaunchServices/$HELPER_EXECUTABLE"
 chmod +x "$APP/Contents/Library/LaunchServices/$HELPER_EXECUTABLE"
 cp "$ROOT/Resources/AppIcon.png" "$APP/Contents/Resources/AppIcon.png"
 cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+cp "$ROOT/LICENSE" "$APP/Contents/Resources/LICENSE.txt"
 
 cat > "$APP/Contents/Library/LaunchDaemons/$HELPER_ID.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -80,5 +141,43 @@ PLIST
 /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $APP_VERSION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 14.0" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$APP/Contents/Info.plist"
+
+require_plist_value() {
+    local plist="$1"
+    local key="$2"
+    local expected="$3"
+    local actual
+    actual="$(/usr/libexec/PlistBuddy -c "Print :$key" "$plist" 2>/dev/null || true)"
+    if [[ "$actual" != "$expected" ]]; then
+        echo "Invalid plist value in $plist: $key is '$actual', expected '$expected'" >&2
+        exit 1
+    fi
+}
+
+APP_PLIST="$APP/Contents/Info.plist"
+HELPER_PLIST="$APP/Contents/Library/LaunchDaemons/$HELPER_ID.plist"
+
+plutil -lint "$APP_PLIST" >/dev/null
+plutil -lint "$HELPER_PLIST" >/dev/null
+require_plist_value "$APP_PLIST" CFBundleExecutable "$APP_EXECUTABLE"
+require_plist_value "$APP_PLIST" CFBundleIdentifier "$BUNDLE_ID"
+require_plist_value "$APP_PLIST" CFBundleVersion "$BUILD_NUMBER"
+require_plist_value "$APP_PLIST" CFBundleShortVersionString "$APP_VERSION"
+require_plist_value "$APP_PLIST" CFBundlePackageType APPL
+require_plist_value "$HELPER_PLIST" Label "$HELPER_ID"
+require_plist_value "$HELPER_PLIST" BundleProgram "Contents/Library/LaunchServices/$HELPER_EXECUTABLE"
+require_plist_value "$HELPER_PLIST" "MachServices:$HELPER_ID" true
+require_plist_value "$HELPER_PLIST" "AssociatedBundleIdentifiers:0" "$BUNDLE_ID"
+
+APP_ARCHS="$(lipo -archs "$APP/Contents/MacOS/$APP_EXECUTABLE")"
+HELPER_ARCHS="$(lipo -archs "$APP/Contents/Library/LaunchServices/$HELPER_EXECUTABLE")"
+if [[ "$APP_ARCHS" != "$HELPER_ARCHS" ]]; then
+    echo "App/helper architecture mismatch: app='$APP_ARCHS', helper='$HELPER_ARCHS'" >&2
+    exit 1
+fi
+if [[ "$PACKAGING_MODE" == "release" && "$APP_ARCHS" != "arm64" ]]; then
+    echo "Release artifacts must be arm64-only for the supported Apple Silicon target; found '$APP_ARCHS'." >&2
+    exit 1
+fi
 
 echo "$APP"

@@ -1,64 +1,104 @@
 import FanCtlHelperXPC
+import Dispatch
 import Foundation
 import ServiceManagement
 
 enum FanCtlHelperClient {
-    static let fanCommandTimeout: TimeInterval = 45.0
+    // A complete transaction can wait up to roughly ten seconds per fan for
+    // firmware to release manual mode. Keep this above the ten-fan core limit.
+    static let fanCommandTimeout: TimeInterval = 120.0
     static let automaticFallbackTimeout: TimeInterval = 5.0
+    private static let sequenceGenerator = MutationSequenceGenerator()
 
     enum Error: LocalizedError {
         case unavailable
-        case rejected(String)
+        case rejected(code: String?, message: String)
         case invalidResponse
+        case incompatibleHelper
 
         var errorDescription: String? {
             switch self {
             case .unavailable:
                 L10n.helperUnavailable
-            case .rejected(let message):
+            case .rejected(_, let message):
                 message
             case .invalidResponse:
                 L10n.invalidHelperResponse
+            case .incompatibleHelper:
+                L10n.incompatibleHelper
             }
         }
+
     }
 
     static func waitUntilAvailable(timeout: TimeInterval) async throws {
+        guard timeout.isFinite, timeout > 0 else {
+            throw Error.unavailable
+        }
         let deadline = Date().addingTimeInterval(timeout)
         var lastError: Swift.Error = Error.unavailable
 
-        while Date() < deadline {
+        while true {
+            try Task.checkCancellation()
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else {
+                throw lastError
+            }
+
             do {
-                _ = try await send("PING")
+                _ = try await send("GET_VERSION", timeout: min(0.75, remaining))
                 return
+            } catch Error.incompatibleHelper {
+                throw Error.incompatibleHelper
             } catch {
                 lastError = error
-                try await Task.sleep(nanoseconds: 100_000_000)
+                let sleepInterval = min(0.1, max(0, deadline.timeIntervalSinceNow))
+                guard sleepInterval > 0 else {
+                    throw lastError
+                }
+                try await Task.sleep(nanoseconds: UInt64(sleepInterval * 1_000_000_000))
             }
         }
-
-        throw lastError
     }
 
-    static func send(_ command: String, timeout: TimeInterval = 5.0) async throws -> String {
-        try await withThrowingTaskGroup(of: String.self) { group in
+    static func nextMutationSequence() -> Int64 {
+        sequenceGenerator.next()
+    }
+
+    static func send(
+        _ command: String,
+        timeout: TimeInterval = 5.0,
+        mutationSequence: Int64? = nil
+    ) async throws -> String {
+        guard timeout.isFinite, timeout > 0 else {
+            throw Error.unavailable
+        }
+        let timeoutNanoseconds = UInt64(min(timeout, 3_600) * 1_000_000_000)
+        let resolvedSequence = isMutationCommand(command)
+            ? (mutationSequence ?? nextMutationSequence())
+            : nil
+
+        return try await withThrowingTaskGroup(of: String.self) { group in
+            defer { group.cancelAll() }
             group.addTask {
-                try await sendWithoutTimeout(command)
+                try await sendWithoutTimeout(command, mutationSequence: resolvedSequence)
             }
             group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                try await Task.sleep(nanoseconds: timeoutNanoseconds)
                 throw Error.unavailable
             }
 
             guard let result = try await group.next() else {
                 throw Error.unavailable
             }
-            group.cancelAll()
             return result
         }
     }
 
-    private static func sendWithoutTimeout(_ command: String) async throws -> String {
+    private static func sendWithoutTimeout(
+        _ command: String,
+        mutationSequence: Int64?
+    ) async throws -> String {
         let connection = NSXPCConnection(
             machServiceName: FanCtlHelperConstants.machServiceName,
             options: .privileged
@@ -74,37 +114,86 @@ enum FanCtlHelperClient {
                     if let response {
                         state.finish(.success(response as String))
                     } else if let errorMessage {
-                        state.finish(.failure(Error.rejected(errorMessage as String)))
+                        let encoded = errorMessage as String
+                        if let failure = FanCtlHelperWire.decodeFailure(encoded) {
+                            state.finish(.failure(Error.rejected(code: failure.code, message: failure.message)))
+                        } else {
+                            state.finish(.failure(Error.rejected(code: nil, message: encoded)))
+                        }
                     } else {
                         state.finish(.failure(Error.invalidResponse))
                     }
                 }
 
+                connection.interruptionHandler = {
+                    state.finish(.failure(Error.unavailable))
+                }
+                connection.invalidationHandler = {
+                    state.finish(.failure(Error.unavailable))
+                }
+
+                if Task.isCancelled {
+                    state.finish(.failure(CancellationError()))
+                    return
+                }
+
                 connection.resume()
                 guard let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
-                    state.finish(.failure(Error.rejected(error.localizedDescription)))
+                    NSLog("mFanCtl helper XPC transport error: \(error.localizedDescription)")
+                    state.finish(.failure(Error.unavailable))
                 }) as? FanCtlHelperXPCProtocol else {
                     state.finish(.failure(Error.unavailable))
                     return
                 }
 
                 do {
+                    let sequenceNumber = mutationSequence.map { NSNumber(value: $0) }
                     switch command {
                     case "PING":
                         proxy.ping(withReply: reply)
+                    case "GET_VERSION":
+                        proxy.getVersion { version, helperBuild in
+                            guard version.intValue == FanCtlHelperConstants.protocolVersion else {
+                                state.finish(.failure(Error.incompatibleHelper))
+                                return
+                            }
+                            if let expectedBuild = currentApplicationBuild,
+                               helperBuild.length > 0,
+                               helperBuild as String != "unknown",
+                               helperBuild as String != expectedBuild {
+                                state.finish(.failure(Error.incompatibleHelper))
+                                return
+                            }
+                            state.finish(.success("version \(version.intValue) build \(helperBuild)"))
+                        }
                     case "SET_AUTOMATIC":
-                        proxy.setAutomatic(withReply: reply)
+                        guard let sequenceNumber else {
+                            throw Error.invalidResponse
+                        }
+                        proxy.setAutomatic(sequenceNumber, withReply: reply)
                     case "SET_MAXIMUM":
-                        proxy.setMaximum(withReply: reply)
+                        guard let sequenceNumber else {
+                            throw Error.invalidResponse
+                        }
+                        proxy.setMaximum(sequenceNumber, withReply: reply)
+                    case "RENEW_MANUAL_LEASE":
+                        guard let sequenceNumber else {
+                            throw Error.invalidResponse
+                        }
+                        proxy.renewManualControlLease(sequenceNumber, withReply: reply)
                     default:
                         if command.hasPrefix("SET_RPM ") {
                             let rawRPM = String(command.dropFirst("SET_RPM ".count))
-                            guard let rpm = Double(rawRPM), rpm.isFinite else {
-                                throw Error.rejected(L10n.invalidHelperResponse)
+                            guard let rpm = Int(rawRPM),
+                                  (FanCtlHelperConstants.minimumRPM...FanCtlHelperConstants.maximumEncodedRPM).contains(rpm) else {
+                                throw Error.rejected(code: "invalid_request", message: L10n.invalidHelperResponse)
                             }
-                            proxy.setRPM(NSNumber(value: rpm), withReply: reply)
+                            guard let sequenceNumber else {
+                                throw Error.invalidResponse
+                            }
+                            proxy.setRPM(NSNumber(value: rpm), sequence: sequenceNumber, withReply: reply)
                         } else {
-                            throw Error.rejected(L10n.invalidHelperResponse)
+                            throw Error.rejected(code: "invalid_request", message: L10n.invalidHelperResponse)
                         }
                     }
                 } catch {
@@ -115,11 +204,48 @@ enum FanCtlHelperClient {
             connectionHandle.invalidate()
         }
     }
+
+    private static var currentApplicationBuild: String? {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+              !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+
+    private static func isMutationCommand(_ command: String) -> Bool {
+        command == "SET_AUTOMATIC" ||
+            command == "SET_MAXIMUM" ||
+            command == "RENEW_MANUAL_LEASE" ||
+            command.hasPrefix("SET_RPM ")
+    }
+}
+
+private final class MutationSequenceGenerator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Int64
+
+    init() {
+        let uptime = DispatchTime.now().uptimeNanoseconds
+        value = Int64(min(uptime, UInt64(Int64.max - 1_000_000)))
+    }
+
+    func next() -> Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        if value == Int64.max {
+            value = 0
+        } else {
+            value += 1
+        }
+        return value
+    }
 }
 
 private final class XPCConnectionHandle: @unchecked Sendable {
     private let lock = NSLock()
     private let connection: NSXPCConnection
+    private var didInvalidate = false
 
     init(_ connection: NSXPCConnection) {
         self.connection = connection
@@ -127,7 +253,14 @@ private final class XPCConnectionHandle: @unchecked Sendable {
 
     func invalidate() {
         lock.lock()
-        defer { lock.unlock() }
+        guard !didInvalidate else {
+            lock.unlock()
+            return
+        }
+        didInvalidate = true
+        lock.unlock()
+        connection.interruptionHandler = nil
+        connection.invalidationHandler = nil
         connection.invalidate()
     }
 }
@@ -180,6 +313,24 @@ enum FanCtlHelperInstaller {
         }
     }
 
+    static func reinstall() throws {
+        let service = SMAppService.daemon(plistName: FanCtlHelperConstants.daemonPlistName)
+        switch service.status {
+        case .enabled:
+            try service.unregister()
+        case .requiresApproval:
+            throw InstallError.requiresApproval
+        case .notRegistered, .notFound:
+            break
+        @unknown default:
+            break
+        }
+
+        UserDefaults.standard.removeObject(forKey: registeredHelperBuildKey)
+        clearPendingBuild()
+        try register(service)
+    }
+
     private static func refreshEnabledServiceIfNeeded(_ service: SMAppService) throws {
         guard let currentBuild = currentBuildNumber else {
             return
@@ -194,12 +345,16 @@ enum FanCtlHelperInstaller {
         }
 
         if pendingBuild == currentBuild {
+            // A previous refresh reached the approval step. An enabled service now
+            // means macOS completed that registration.
             rememberRegisteredBuild(currentBuild)
             clearPendingBuild()
             return
         }
 
-        rememberRegisteredBuild(currentBuild)
+        try service.unregister()
+        rememberPendingBuild(currentBuild)
+        try register(service)
     }
 
     private static func register(_ service: SMAppService) throws {

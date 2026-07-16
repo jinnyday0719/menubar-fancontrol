@@ -41,6 +41,10 @@ let package = Package(
         .testTarget(
             name: "mFanCtlCoreTests",
             dependencies: ["FanCtlCore"]
+        ),
+        .testTarget(
+            name: "FanCtlHelperXPCTests",
+            dependencies: ["FanCtlHelperXPC"]
         )
     ]
 )

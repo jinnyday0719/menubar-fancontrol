@@ -1,8 +1,65 @@
 import Foundation
 
-public enum FanControlStrategy: Sendable {
+public enum FanControlStrategy: Equatable, Sendable {
     case directModeWrite
     case forceTestUnlock
+}
+
+public enum ObservedFanMode: Equatable, Sendable {
+    case automatic
+    case manual
+    case systemManaged
+    case unknown(Int)
+
+    public init(rawValue: Int) {
+        switch rawValue {
+        case 0:
+            self = .automatic
+        case 1:
+            self = .manual
+        case 3:
+            self = .systemManaged
+        default:
+            self = .unknown(rawValue)
+        }
+    }
+
+    public var rawValue: Int {
+        switch self {
+        case .automatic: 0
+        case .manual: 1
+        case .systemManaged: 3
+        case .unknown(let rawValue): rawValue
+        }
+    }
+
+    public var isSystemControlled: Bool {
+        self == .automatic || self == .systemManaged
+    }
+}
+
+public struct FanModeState: Equatable, Sendable {
+    public let fanIndex: Int
+    public let mode: ObservedFanMode
+
+    public init(fanIndex: Int, mode: ObservedFanMode) {
+        self.fanIndex = fanIndex
+        self.mode = mode
+    }
+}
+
+public struct FanAutomaticControlStatus: Equatable, Sendable {
+    public let fans: [FanModeState]
+    public let forceTestMode: Int?
+
+    public init(fans: [FanModeState], forceTestMode: Int?) {
+        self.fans = fans
+        self.forceTestMode = forceTestMode
+    }
+
+    public var isFullyAutomatic: Bool {
+        fans.allSatisfy(\.mode.isSystemControlled) && (forceTestMode == nil || forceTestMode == 0)
+    }
 }
 
 public struct FanControlResult: Sendable {
@@ -12,148 +69,493 @@ public struct FanControlResult: Sendable {
     public let strategy: FanControlStrategy
 }
 
+public enum FanControlError: Error, LocalizedError, Sendable {
+    case invalidFanCount(Double)
+    case invalidFanIndex(index: Int, fanCount: Int)
+    case invalidRPM(Double)
+    case invalidRPMRange(fanIndex: Int, minimum: Double, maximum: Double)
+    case unsupportedSMCEncoding(key: String, dataType: String, dataSize: UInt32)
+    case modeVerificationFailed(fanIndex: Int, expected: String, actual: Int)
+    case valueVerificationFailed(key: String, expected: Int, actual: Int)
+    case targetVerificationFailed(fanIndex: Int, expected: Double, actual: Double)
+    case rollbackFailed(originalError: String, rollbackError: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidFanCount(let value):
+            "FNum returned an invalid fan count: \(value)."
+        case .invalidFanIndex(let index, let fanCount):
+            "Fan index \(index) is outside the available range 0..<\(fanCount)."
+        case .invalidRPM(let rpm):
+            "The requested fan speed must be a finite, nonnegative RPM value; received \(rpm)."
+        case .invalidRPMRange(let fanIndex, let minimum, let maximum):
+            "Fan \(fanIndex) returned an invalid RPM range \(minimum)...\(maximum)."
+        case .unsupportedSMCEncoding(let key, let dataType, let dataSize):
+            "SMC key \(key) uses unsupported encoding \(dataType) (\(dataSize) bytes)."
+        case .modeVerificationFailed(let fanIndex, let expected, let actual):
+            "Fan \(fanIndex) mode verification failed: expected \(expected), received raw mode \(actual)."
+        case .valueVerificationFailed(let key, let expected, let actual):
+            "SMC key \(key) verification failed: expected \(expected), received \(actual)."
+        case .targetVerificationFailed(let fanIndex, let expected, let actual):
+            "Fan \(fanIndex) target verification failed: expected \(expected) RPM, received \(actual) RPM."
+        case .rollbackFailed(let originalError, let rollbackError):
+            "Fan control failed (\(originalError)), and restoring the previous safe state also failed (\(rollbackError))."
+        }
+    }
+}
+
+struct FanControlTiming: Sendable {
+    let forceTestWriteAttempts: Int
+    let forceTestWriteDelay: TimeInterval
+    let forceTestActivationDelay: TimeInterval
+    let manualModeWriteAttempts: Int
+    let manualModeWriteDelay: TimeInterval
+
+    static let production = FanControlTiming(
+        forceTestWriteAttempts: 100,
+        forceTestWriteDelay: 0.05,
+        forceTestActivationDelay: 0.5,
+        manualModeWriteAttempts: 100,
+        manualModeWriteDelay: 0.1
+    )
+
+    static let immediate = FanControlTiming(
+        forceTestWriteAttempts: 2,
+        forceTestWriteDelay: 0,
+        forceTestActivationDelay: 0,
+        manualModeWriteAttempts: 2,
+        manualModeWriteDelay: 0
+    )
+}
+
 public final class FanController: Sendable {
+    private struct ManualPreflight {
+        let fanIndex: Int
+        let modeKey: String
+        let modeValue: SMCValue
+        let initialMode: ObservedFanMode
+        let targetValue: SMCValue
+        let initialTargetRPM: Double
+    }
+
     private let smc: any SMCClient
+    private let timing: FanControlTiming
+    private let controlLock = NSRecursiveLock()
 
     public init(smc: any SMCClient) {
         self.smc = smc
+        self.timing = .production
+    }
+
+    init(smc: any SMCClient, timing: FanControlTiming) {
+        self.smc = smc
+        self.timing = timing
     }
 
     public convenience init() throws {
         try self.init(smc: SMCConnection())
     }
 
+    public func fanCount() throws -> Int {
+        controlLock.lock()
+        defer { controlLock.unlock() }
+
+        let rawCount = try readNumeric("FNum")
+        guard rawCount >= 0,
+              rawCount <= 10,
+              rawCount.rounded(.towardZero) == rawCount else {
+            throw FanControlError.invalidFanCount(rawCount)
+        }
+        return Int(rawCount)
+    }
+
+    public func automaticControlStatus() throws -> FanAutomaticControlStatus {
+        controlLock.lock()
+        defer { controlLock.unlock() }
+
+        let count = try fanCount()
+        let fans = try (0..<count).map { index in
+            let resolved = try resolveFanMode(fanIndex: index)
+            return FanModeState(fanIndex: index, mode: resolved.mode)
+        }
+        let forceTest = try readOptionalValue("Ftst").map { value in
+            try integerValue(value, key: "Ftst")
+        }
+        return FanAutomaticControlStatus(fans: fans, forceTestMode: forceTest)
+    }
+
     public func setManual(fanIndex: Int, rpm requestedRPM: Double) throws -> FanControlResult {
-        let minimum = smc.numericValue(for: "F\(fanIndex)Mn") ?? 0
-        let maximum = smc.numericValue(for: "F\(fanIndex)Mx") ?? requestedRPM
-        let appliedRPM = min(max(requestedRPM, minimum), maximum)
-        let strategy = try enableManualMode(fanIndex: fanIndex)
-        do {
-            try writeRPM(fanIndex: fanIndex, rpm: appliedRPM)
-        } catch {
-            try? setAutomatic(fanIndex: fanIndex)
-            throw error
+        controlLock.lock()
+        defer { controlLock.unlock() }
+
+        guard requestedRPM.isFinite, requestedRPM >= 0 else {
+            throw FanControlError.invalidRPM(requestedRPM)
+        }
+        try validateFanIndex(fanIndex)
+
+        let resolvedMode = try resolveFanMode(fanIndex: fanIndex)
+        let minimum = try readNumeric("F\(fanIndex)Mn")
+        let maximum = try readNumeric("F\(fanIndex)Mx")
+        guard minimum >= 0, maximum >= minimum else {
+            throw FanControlError.invalidRPMRange(
+                fanIndex: fanIndex,
+                minimum: minimum,
+                maximum: maximum
+            )
         }
 
-        return FanControlResult(
+        let targetKey = "F\(fanIndex)Tg"
+        let targetValue = try smc.read(targetKey)
+        let initialTargetRPM = try numericValue(targetValue, key: targetKey)
+        let appliedRPM = min(max(requestedRPM, minimum), maximum)
+        _ = try encodeRPM(appliedRPM, for: targetValue)
+
+        let preflight = ManualPreflight(
             fanIndex: fanIndex,
-            requestedRPM: requestedRPM,
-            appliedRPM: appliedRPM,
-            strategy: strategy
+            modeKey: resolvedMode.key,
+            modeValue: resolvedMode.value,
+            initialMode: resolvedMode.mode,
+            targetValue: targetValue,
+            initialTargetRPM: initialTargetRPM
         )
+
+        do {
+            let strategy = try enableManualMode(preflight: preflight)
+            try writeRPM(fanIndex: fanIndex, rpm: appliedRPM, targetValue: targetValue)
+            let verifiedRPM = try readNumeric(targetKey)
+            guard speedsMatch(verifiedRPM, appliedRPM) else {
+                throw FanControlError.targetVerificationFailed(
+                    fanIndex: fanIndex,
+                    expected: appliedRPM,
+                    actual: verifiedRPM
+                )
+            }
+
+            return FanControlResult(
+                fanIndex: fanIndex,
+                requestedRPM: requestedRPM,
+                appliedRPM: verifiedRPM,
+                strategy: strategy
+            )
+        } catch {
+            do {
+                try rollback(preflight)
+            } catch let rollbackError {
+                throw FanControlError.rollbackFailed(
+                    originalError: error.localizedDescription,
+                    rollbackError: rollbackError.localizedDescription
+                )
+            }
+            throw error
+        }
     }
 
     public func setAutomatic(fanIndex: Int) throws {
-        let modeKey = fanModeKey(fanIndex: fanIndex)
-        if let currentMode = smc.numericValue(for: modeKey), currentMode == 0 || currentMode == 3 {
-            clearTestModeIfNeeded()
-            return
-        }
+        controlLock.lock()
+        defer { controlLock.unlock() }
 
-        do {
-            try smc.write(modeKey, bytes: [0])
-        } catch {
-            if let currentMode = smc.numericValue(for: modeKey), currentMode == 0 || currentMode == 3 {
-                clearTestModeIfNeeded()
-                return
-            }
-            throw error
-        }
-
-        if (try? smc.read("F\(fanIndex)Tg").dataSize) != nil {
-            try? writeRPM(fanIndex: fanIndex, rpm: 0)
-        }
-
-        clearTestModeIfNeeded()
+        try validateFanIndex(fanIndex)
+        let resolved = try resolveFanMode(fanIndex: fanIndex)
+        try restoreSystemControl(fanIndex: fanIndex, modeKey: resolved.key, modeValue: resolved.value)
     }
 
-    private func enableManualMode(fanIndex: Int) throws -> FanControlStrategy {
-        let modeKey = fanModeKey(fanIndex: fanIndex)
+    private func validateFanIndex(_ fanIndex: Int) throws {
+        let count = try fanCount()
+        guard fanIndex >= 0, fanIndex < count else {
+            throw FanControlError.invalidFanIndex(index: fanIndex, fanCount: count)
+        }
+    }
 
-        if smc.numericValue(for: modeKey) == 1 {
+    private func enableManualMode(preflight: ManualPreflight) throws -> FanControlStrategy {
+        if preflight.initialMode == .manual {
             return .directModeWrite
         }
 
+        var directWriteError: Error?
         do {
-            try smc.write(modeKey, bytes: [1])
-            if smc.numericValue(for: modeKey) == 1 {
-                return .directModeWrite
+            try writeInteger(1, key: preflight.modeKey, reference: preflight.modeValue)
+            let observed = try readMode(key: preflight.modeKey)
+            guard observed == .manual else {
+                throw FanControlError.modeVerificationFailed(
+                    fanIndex: preflight.fanIndex,
+                    expected: "manual (raw mode 1)",
+                    actual: observed.rawValue
+                )
             }
-        } catch let directWriteError {
-            guard hasKey("Ftst") else {
-                throw directWriteError
+            return .directModeWrite
+        } catch {
+            directWriteError = error
+        }
+
+        guard let forceTestValue = try readOptionalValue("Ftst") else {
+            throw directWriteError ?? FanControlError.modeVerificationFailed(
+                fanIndex: preflight.fanIndex,
+                expected: "manual (raw mode 1)",
+                actual: preflight.initialMode.rawValue
+            )
+        }
+
+        if try integerValue(forceTestValue, key: "Ftst") != 1 {
+            try writeIntegerWithRetry(
+                1,
+                key: "Ftst",
+                reference: forceTestValue,
+                maxAttempts: timing.forceTestWriteAttempts,
+                delay: timing.forceTestWriteDelay
+            )
+            if timing.forceTestActivationDelay > 0 {
+                Thread.sleep(forTimeInterval: timing.forceTestActivationDelay)
             }
         }
 
-        if smc.numericValue(for: "Ftst") != 1 {
-            try writeWithRetry(key: "Ftst", bytes: [1], maxAttempts: 100, delay: 0.05)
-            Thread.sleep(forTimeInterval: 3.0)
-        }
-
-        try writeWithRetry(key: modeKey, bytes: [1], maxAttempts: 300, delay: 0.1)
+        try writeModeWithRetry(
+            fanIndex: preflight.fanIndex,
+            modeKey: preflight.modeKey,
+            reference: preflight.modeValue,
+            maxAttempts: timing.manualModeWriteAttempts,
+            delay: timing.manualModeWriteDelay
+        )
         return .forceTestUnlock
     }
 
-    private func writeRPM(fanIndex: Int, rpm: Double) throws {
-        let targetKey = "F\(fanIndex)Tg"
-        let target = try smc.read(targetKey)
-
-        switch target.dataType {
-        case "flt ":
-            var value = Float(rpm)
-            let bytes = withUnsafeBytes(of: &value) { Array($0) }
-            try smc.write(targetKey, bytes: bytes)
-        case "fpe2":
-            let intValue = Int(rpm.rounded())
-            try smc.write(targetKey, bytes: [
-                UInt8(intValue >> 6),
-                UInt8((intValue << 2) ^ ((intValue >> 6) << 8))
-            ])
-        default:
-            throw SMCError.firmwareRejected(key: targetKey, 0x89)
+    private func rollback(_ preflight: ManualPreflight) throws {
+        if preflight.initialMode == .manual {
+            try writeRPM(
+                fanIndex: preflight.fanIndex,
+                rpm: preflight.initialTargetRPM,
+                targetValue: preflight.targetValue
+            )
+            let restoredTarget = try readNumeric("F\(preflight.fanIndex)Tg")
+            guard speedsMatch(restoredTarget, preflight.initialTargetRPM) else {
+                throw FanControlError.targetVerificationFailed(
+                    fanIndex: preflight.fanIndex,
+                    expected: preflight.initialTargetRPM,
+                    actual: restoredTarget
+                )
+            }
+            try writeInteger(1, key: preflight.modeKey, reference: preflight.modeValue)
+            let mode = try readMode(key: preflight.modeKey)
+            guard mode == .manual else {
+                throw FanControlError.modeVerificationFailed(
+                    fanIndex: preflight.fanIndex,
+                    expected: "the previous manual state (raw mode 1)",
+                    actual: mode.rawValue
+                )
+            }
+            return
         }
+
+        try restoreSystemControl(
+            fanIndex: preflight.fanIndex,
+            modeKey: preflight.modeKey,
+            modeValue: preflight.modeValue
+        )
     }
 
-    private func fanModeKey(fanIndex: Int) -> String {
-        if smc.numericValue(for: "F\(fanIndex)md") != nil {
-            return "F\(fanIndex)md"
-        }
-        return "F\(fanIndex)Md"
-    }
-
-    private func allFansAreAutomatic() -> Bool {
-        guard let count = smc.numericValue(for: "FNum") else {
-            return true
-        }
-
-        for index in 0..<Int(count) {
-            let mode = smc.numericValue(for: fanModeKey(fanIndex: index))
-            guard mode == 0 || mode == 3 else {
-                return false
+    private func restoreSystemControl(fanIndex: Int, modeKey: String, modeValue: SMCValue) throws {
+        var observed = try readMode(key: modeKey)
+        if !observed.isSystemControlled {
+            try writeInteger(0, key: modeKey, reference: modeValue)
+            observed = try readMode(key: modeKey)
+            guard observed.isSystemControlled else {
+                throw FanControlError.modeVerificationFailed(
+                    fanIndex: fanIndex,
+                    expected: "automatic or system-managed (raw mode 0 or 3)",
+                    actual: observed.rawValue
+                )
             }
         }
-        return true
-    }
 
-    private func clearTestModeIfNeeded() {
-        if allFansAreAutomatic(), (try? smc.read("Ftst").dataSize) != nil {
-            try? smc.write("Ftst", bytes: [0])
+        try clearForceTestModeWhenSafe()
+
+        observed = try readMode(key: modeKey)
+        guard observed.isSystemControlled else {
+            throw FanControlError.modeVerificationFailed(
+                fanIndex: fanIndex,
+                expected: "automatic or system-managed (raw mode 0 or 3)",
+                actual: observed.rawValue
+            )
         }
     }
 
-    private func hasKey(_ key: String) -> Bool {
-        guard let value = try? smc.read(key) else {
-            return false
+    private func clearForceTestModeWhenSafe() throws {
+        let count = try fanCount()
+        for index in 0..<count {
+            guard try resolveFanMode(fanIndex: index).mode.isSystemControlled else {
+                return
+            }
         }
-        return value.dataSize > 0
+
+        guard let forceTestValue = try readOptionalValue("Ftst") else {
+            return
+        }
+        let current = try integerValue(forceTestValue, key: "Ftst")
+        guard current != 0 else {
+            return
+        }
+
+        try writeInteger(0, key: "Ftst", reference: forceTestValue)
+        guard let verifiedValue = try readOptionalValue("Ftst") else {
+            throw SMCError.invalidNumericValue(key: "Ftst")
+        }
+        let verified = try integerValue(verifiedValue, key: "Ftst")
+        guard verified == 0 else {
+            throw FanControlError.valueVerificationFailed(
+                key: "Ftst",
+                expected: 0,
+                actual: verified
+            )
+        }
+
+        for index in 0..<count {
+            let mode = try resolveFanMode(fanIndex: index).mode
+            guard mode.isSystemControlled else {
+                throw FanControlError.modeVerificationFailed(
+                    fanIndex: index,
+                    expected: "automatic or system-managed after clearing Ftst",
+                    actual: mode.rawValue
+                )
+            }
+        }
     }
 
-    private func writeWithRetry(key: String, bytes: [UInt8], maxAttempts: Int, delay: TimeInterval) throws {
+    private func writeRPM(fanIndex: Int, rpm: Double, targetValue: SMCValue) throws {
+        let targetKey = "F\(fanIndex)Tg"
+        try smc.write(targetKey, bytes: encodeRPM(rpm, for: targetValue))
+    }
+
+    private func encodeRPM(_ rpm: Double, for target: SMCValue) throws -> [UInt8] {
+        guard rpm.isFinite, rpm >= 0 else {
+            throw FanControlError.invalidRPM(rpm)
+        }
+
+        switch (target.dataType, target.dataSize) {
+        case ("flt ", 4):
+            var value = Float(rpm)
+            guard value.isFinite else {
+                throw FanControlError.invalidRPM(rpm)
+            }
+            return withUnsafeBytes(of: &value) { Array($0) }
+        case ("fpe2", 2):
+            let scaledRPM = (rpm * 4).rounded()
+            guard scaledRPM <= Double(UInt16.max) else {
+                throw FanControlError.invalidRPM(rpm)
+            }
+            let raw = UInt16(scaledRPM)
+            return [UInt8(raw >> 8), UInt8(raw & 0xff)]
+        default:
+            throw FanControlError.unsupportedSMCEncoding(
+                key: target.key,
+                dataType: target.dataType,
+                dataSize: target.dataSize
+            )
+        }
+    }
+
+    private func resolveFanMode(fanIndex: Int) throws -> (key: String, value: SMCValue, mode: ObservedFanMode) {
+        var firstError: Error?
+        for key in ["F\(fanIndex)md", "F\(fanIndex)Md"] {
+            do {
+                let value = try smc.read(key)
+                let rawValue = try integerValue(value, key: key)
+                return (key, value, ObservedFanMode(rawValue: rawValue))
+            } catch {
+                if firstError == nil {
+                    firstError = error
+                }
+            }
+        }
+        throw firstError ?? SMCError.invalidNumericValue(key: "F\(fanIndex)Md")
+    }
+
+    private func readMode(key: String) throws -> ObservedFanMode {
+        let value = try smc.read(key)
+        return ObservedFanMode(rawValue: try integerValue(value, key: key))
+    }
+
+    private func readNumeric(_ key: String) throws -> Double {
+        try numericValue(smc.read(key), key: key)
+    }
+
+    private func numericValue(_ value: SMCValue, key: String) throws -> Double {
+        guard let numeric = value.numericValue, numeric.isFinite else {
+            throw SMCError.invalidNumericValue(key: key)
+        }
+        return numeric
+    }
+
+    private func integerValue(_ value: SMCValue, key: String) throws -> Int {
+        let numeric = try numericValue(value, key: key)
+        guard numeric.rounded(.towardZero) == numeric,
+              numeric >= Double(Int.min),
+              numeric <= Double(Int.max) else {
+            throw SMCError.invalidNumericValue(key: key)
+        }
+        return Int(numeric)
+    }
+
+    private func readOptionalValue(_ key: String) throws -> SMCValue? {
+        do {
+            return try smc.read(key)
+        } catch SMCError.firmwareRejected(_, let code) where code == 0x84 {
+            return nil
+        }
+    }
+
+    private func writeInteger(_ rawValue: Int, key: String, reference: SMCValue) throws {
+        try smc.write(key, bytes: try encodeInteger(rawValue, key: key, reference: reference))
+    }
+
+    private func encodeInteger(_ rawValue: Int, key: String, reference: SMCValue) throws -> [UInt8] {
+        switch (reference.dataType, reference.dataSize) {
+        case ("ui8 ", 1):
+            guard let value = UInt8(exactly: rawValue) else {
+                throw SMCError.invalidNumericValue(key: key)
+            }
+            return [value]
+        case ("ui16", 2):
+            guard let value = UInt16(exactly: rawValue) else {
+                throw SMCError.invalidNumericValue(key: key)
+            }
+            return [UInt8(value >> 8), UInt8(value & 0xff)]
+        case ("ui32", 4):
+            guard let value = UInt32(exactly: rawValue) else {
+                throw SMCError.invalidNumericValue(key: key)
+            }
+            return [
+                UInt8((value >> 24) & 0xff),
+                UInt8((value >> 16) & 0xff),
+                UInt8((value >> 8) & 0xff),
+                UInt8(value & 0xff)
+            ]
+        default:
+            throw FanControlError.unsupportedSMCEncoding(
+                key: key,
+                dataType: reference.dataType,
+                dataSize: reference.dataSize
+            )
+        }
+    }
+
+    private func writeIntegerWithRetry(
+        _ rawValue: Int,
+        key: String,
+        reference: SMCValue,
+        maxAttempts: Int,
+        delay: TimeInterval
+    ) throws {
         var lastError: Error?
-
         for attempt in 0..<maxAttempts {
             do {
-                try smc.write(key, bytes: bytes)
+                try writeInteger(rawValue, key: key, reference: reference)
+                let verified = try integerValue(smc.read(key), key: key)
+                guard verified == rawValue else {
+                    throw FanControlError.valueVerificationFailed(
+                        key: key,
+                        expected: rawValue,
+                        actual: verified
+                    )
+                }
                 return
             } catch {
                 lastError = error
@@ -162,9 +564,44 @@ public final class FanController: Sendable {
                 }
             }
         }
+        throw lastError ?? SMCError.invalidNumericValue(key: key)
+    }
 
-        if let lastError {
-            throw lastError
+    private func writeModeWithRetry(
+        fanIndex: Int,
+        modeKey: String,
+        reference: SMCValue,
+        maxAttempts: Int,
+        delay: TimeInterval
+    ) throws {
+        var lastError: Error?
+        for attempt in 0..<maxAttempts {
+            do {
+                try writeInteger(1, key: modeKey, reference: reference)
+                let observed = try readMode(key: modeKey)
+                guard observed == .manual else {
+                    throw FanControlError.modeVerificationFailed(
+                        fanIndex: fanIndex,
+                        expected: "manual (raw mode 1)",
+                        actual: observed.rawValue
+                    )
+                }
+                return
+            } catch {
+                lastError = error
+                if attempt < maxAttempts - 1 {
+                    Thread.sleep(forTimeInterval: delay)
+                }
+            }
         }
+        throw lastError ?? FanControlError.modeVerificationFailed(
+            fanIndex: fanIndex,
+            expected: "manual (raw mode 1)",
+            actual: -1
+        )
+    }
+
+    private func speedsMatch(_ lhs: Double, _ rhs: Double) -> Bool {
+        abs(lhs - rhs) <= max(1, abs(rhs) * 0.001)
     }
 }

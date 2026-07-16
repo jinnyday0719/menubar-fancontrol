@@ -1,6 +1,7 @@
 import AppKit
 import Dispatch
 import FanCtlCore
+import FanCtlHelperXPC
 import QuartzCore
 import ServiceManagement
 
@@ -101,12 +102,24 @@ enum L10n {
     static var presetBaseName: String { text("사전 설정", "Preset") }
     static var maximum: String { text("최대", "Max") }
     static var installingPermission: String { text("팬 제어 준비 중...", "Preparing fan control...") }
+    static var applyingFanPreset: String {
+        text(
+            "팬 제어 모드 전환 중… 몇 초 걸릴 수 있습니다.",
+            "Switching fan mode… This may take a few seconds."
+        )
+    }
     static var smcConnectionFailed: String { text("SMC 연결에 실패했습니다.", "SMC connection failed.") }
     static var noFansFound: String { text("팬을 찾을 수 없습니다.", "No fans found.") }
     static var missingPreset: String { text("사전 설정을 찾을 수 없습니다.", "Preset not found.") }
     static var helperUnavailable: String { text("팬 제어 helper가 설치되어 있지 않습니다.", "Fan control helper is not installed.") }
     static var helperRegistrationFailed: String { text("팬 제어 helper를 등록하지 못했습니다.", "Could not register the fan control helper.") }
     static var invalidHelperResponse: String { text("helper 응답이 올바르지 않습니다.", "Invalid helper response.") }
+    static var incompatibleHelper: String {
+        text(
+            "팬 제어 helper 버전이 앱과 맞지 않습니다. 앱을 다시 실행하세요.",
+            "The fan control helper version does not match the app. Restart the app."
+        )
+    }
     static var helperApprovalPromptTitle: String { text("백그라운드 앱 허용", "Allow Background App") }
     static var helperApprovalPromptMessage: String {
         text(
@@ -115,6 +128,31 @@ enum L10n {
         )
     }
     static var helperRequiresApproval: String { text("백그라운드 앱에서 mFanCtl을 허용해주세요.", "Allow mFanCtl in Background Apps.") }
+    static var presetDataUnreadable: String { text("저장된 사전 설정을 읽을 수 없습니다.", "Saved presets could not be read.") }
+    static var manualFanModeDetected: String {
+        text(
+            "팬이 수동 상태입니다. 자동을 눌러 macOS 제어로 복귀하세요.",
+            "Fans are in manual mode. Choose Automatic to return control to macOS."
+        )
+    }
+    static var unknownFanModeDetected: String {
+        text(
+            "팬 제어 상태를 확인할 수 없습니다. 자동을 눌러 복구하세요.",
+            "Fan control state could not be verified. Choose Automatic to recover."
+        )
+    }
+    static var fanTestModeActive: String {
+        text(
+            "macOS 팬 제어 복귀가 완료되지 않았습니다. 자동을 다시 눌러주세요.",
+            "Returning fan control to macOS is incomplete. Choose Automatic again."
+        )
+    }
+    static var presetNoLongerApplied: String {
+        text(
+            "현재 팬 속도가 선택한 사전 설정과 다릅니다.",
+            "Current fan speed no longer matches the selected preset."
+        )
+    }
     static var updateAvailableTitle: String { text("새 버전이 있습니다", "Update Available") }
     static var noUpdatesTitle: String { text("최신 버전입니다", "You're Up to Date") }
     static var updateCheckFailedTitle: String { text("업데이트 확인 실패", "Update Check Failed") }
@@ -290,6 +328,7 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
     private var isShowingFanHelperApprovalPrompt = false
     private var isRestoringAutomaticBeforeTermination = false
     private var lidStateTimer: Timer?
+    private var lidStatePollTask: Task<Void, Never>?
     private var wasLidClosed = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -346,6 +385,8 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
 
     func applicationWillTerminate(_ notification: Notification) {
         lidStateTimer?.invalidate()
+        lidStatePollTask?.cancel()
+        lidStatePollTask = nil
         model.invalidateTimers()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         DistributedNotificationCenter.default().removeObserver(self)
@@ -517,12 +558,7 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
             object: nil
         )
 
-        if let isLidClosed = LidStateReader.isLidClosed() {
-            wasLidClosed = isLidClosed
-            if isLidClosed {
-                model.applyAutomaticForSleepOrLidClose()
-            }
-        }
+        pollLidState()
 
         let timer = Timer(
             timeInterval: 2,
@@ -540,14 +576,33 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
     }
 
     @objc private func lidStateTimerDidFire() {
-        guard let isLidClosed = LidStateReader.isLidClosed() else {
+        pollLidState()
+    }
+
+    private func pollLidState() {
+        guard lidStatePollTask == nil else {
             return
         }
 
-        if isLidClosed && !wasLidClosed {
-            model.applyAutomaticForSleepOrLidClose()
+        lidStatePollTask = Task { [weak self] in
+            let isLidClosed = await Task.detached {
+                LidStateReader.isLidClosed()
+            }.value
+            guard !Task.isCancelled, let self else {
+                return
+            }
+            if let isLidClosed {
+                if isLidClosed {
+                    if wasLidClosed {
+                        model.ensureAutomaticWhileLidClosed()
+                    } else {
+                        model.applyAutomaticForSleepOrLidClose()
+                    }
+                }
+                wasLidClosed = isLidClosed
+            }
+            lidStatePollTask = nil
         }
-        wasLidClosed = isLidClosed
     }
 
     private func buildMenu() {
@@ -667,9 +722,17 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
 
         if let errorMessage = model.errorMessage {
             errorItem?.title = errorMessage
+            errorItem?.attributedTitle = NSAttributedString(
+                string: errorMessage,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 11),
+                    .foregroundColor: NSColor.secondaryLabelColor
+                ]
+            )
             errorItem?.isHidden = false
         } else {
             errorItem?.title = ""
+            errorItem?.attributedTitle = NSAttributedString(string: "")
             errorItem?.isHidden = true
         }
     }
@@ -2258,7 +2321,7 @@ private final class FanCtlSettingsViewController: NSViewController, NSToolbarDel
 
     @objc private func toggleLaunchAtLogin(_ sender: NSSwitch) {
         let shouldEnable = sender.state == .on
-        UserDefaults.standard.set(shouldEnable, forKey: FanCtlDefaults.launchAtLoginEnabledKey)
+        let previousValue = UserDefaults.standard.bool(forKey: FanCtlDefaults.launchAtLoginEnabledKey)
 
         do {
             if shouldEnable {
@@ -2269,12 +2332,11 @@ private final class FanCtlSettingsViewController: NSViewController, NSToolbarDel
                       SMAppService.mainApp.status != .notFound {
                 try SMAppService.mainApp.unregister()
             }
+            UserDefaults.standard.set(shouldEnable, forKey: FanCtlDefaults.launchAtLoginEnabledKey)
         } catch {
             NSLog("mFanCtl failed to update launch at login: \(error.localizedDescription)")
-            if shouldEnable {
-                UserDefaults.standard.set(false, forKey: FanCtlDefaults.launchAtLoginEnabledKey)
-                sender.state = .off
-            }
+            UserDefaults.standard.set(previousValue, forKey: FanCtlDefaults.launchAtLoginEnabledKey)
+            sender.state = previousValue ? .on : .off
         }
     }
 
@@ -2471,9 +2533,45 @@ private final class SettingsContentView: NSView {
     }
 }
 
+private actor SensorSampler {
+    private var reader: SensorReader?
+
+    func snapshot() throws -> SensorSnapshot {
+        if reader == nil {
+            reader = try SensorReader()
+        }
+        guard let reader else {
+            throw FanCtlMenuError.smcUnavailable
+        }
+        do {
+            return try reader.snapshotStrict()
+        } catch {
+            // IOKit connections can become stale across sleep or service restarts.
+            // Reopen on the next sample instead of retaining a permanently failed handle.
+            self.reader = nil
+            throw error
+        }
+    }
+}
+
 @MainActor
 final class FanCtlMenuBarModel: NSObject {
     static let defaultMenuBarTitleFormat = "{RPM}rpm | {TEMP}℃"
+
+    private enum NoticeSource: Int, CaseIterable {
+        case control
+        case lease
+        case permission
+        case mode
+        case helper
+        case presets
+        case sensor
+    }
+
+    private enum StoredPresetLoadResult {
+        case loaded([UserFanPreset])
+        case unreadable
+    }
 
     var didChange: (@MainActor () -> Void)?
     var didChangePresetList: (@MainActor () -> Void)?
@@ -2489,8 +2587,15 @@ final class FanCtlMenuBarModel: NSObject {
         didSet { didChange?() }
     }
     private(set) var menuBarTitleFormat = FanCtlMenuBarModel.loadMenuBarTitleFormat()
-    private(set) var selectedPreset: FanPreset = .automatic {
-        didSet { didChange?() }
+    private(set) var selectedPreset: FanPreset? {
+        didSet {
+            if let selectedPreset, selectedPreset != .automatic {
+                startManualControlMaintenance()
+            } else {
+                stopManualControlMaintenance()
+            }
+            didChange?()
+        }
     }
     private var helperState: HelperState = .unknown {
         didSet { didChange?() }
@@ -2500,6 +2605,9 @@ final class FanCtlMenuBarModel: NSObject {
     }
     private(set) var userPresets: [UserFanPreset] = [] {
         didSet {
+            guard !isLoadingUserPresets else {
+                return
+            }
             saveUserPresets()
             didChangePresetList?()
             didChange?()
@@ -2509,9 +2617,28 @@ final class FanCtlMenuBarModel: NSObject {
     private let refreshInterval: TimeInterval = 2
     private static let maximumStaleTemperatureAge: TimeInterval = 30
     private static let userPresetsKey = "userFanPresets"
+    private static let absoluteUserRPMRange =
+        FanCtlHelperConstants.minimumRPM...FanCtlHelperConstants.maximumEncodedRPM
     private var lastValidGPUTemperature: Int?
     private var lastValidGPUTemperatureDate: Date?
-    private var reader: SensorReader?
+    private let sensorSampler = SensorSampler()
+    private var sensorRefreshTask: Task<Void, Never>?
+    private var helperProbeTask: Task<Void, Never>?
+    private var helperPreparationTask: Task<Void, Never>?
+    private var controlTask: Task<Void, Never>?
+    private var safetyRecoveryTask: Task<Void, Never>?
+    private var manualLeaseRenewalTask: Task<Void, Never>?
+    private var manualLeaseTimer: Timer?
+    private var manualControlActivity: (any NSObjectProtocol)?
+    private var controlGeneration = 0
+    private var pendingPreset: FanPreset?
+    private var safetyRecoveryPending = false
+    private var helperProbeFailureCount = 0
+    private var lastHelperProbeDate: Date?
+    private var manualLeaseFailureCount = 0
+    private var manualLeaseRenewalGeneration = 0
+    private var notices: [NoticeSource: String] = [:]
+    private var isLoadingUserPresets = true
     private var timer: Timer?
 
     var presetEntries: [FanPresetEntry] {
@@ -2546,39 +2673,69 @@ final class FanCtlMenuBarModel: NSObject {
     }
 
     var validUserRPMRange: ClosedRange<Int> {
-        guard let snapshot,
-              let maximum = average(snapshot.fans.compactMap(\.maximumRPM)),
-              maximum >= 1
-        else {
-            return 1...20000
+        guard let snapshot, !snapshot.fans.isEmpty else {
+            return Self.absoluteUserRPMRange
         }
-        return 1...max(1, Int(maximum.rounded()))
+
+        let minimums = snapshot.fans.compactMap(\.minimumRPM).filter { $0.isFinite && $0 >= 0 }
+        let maximums = snapshot.fans.compactMap(\.maximumRPM).filter { $0.isFinite && $0 >= 1 }
+        guard maximums.count == snapshot.fans.count,
+              let smallestMaximum = maximums.min(),
+              smallestMaximum <= Double(Int.max)
+        else {
+            return Self.absoluteUserRPMRange
+        }
+
+        let greatestMinimum = minimums.max() ?? Double(Self.absoluteUserRPMRange.lowerBound)
+        guard greatestMinimum <= Double(Int.max) else {
+            return Self.absoluteUserRPMRange
+        }
+
+        let lowerBound = max(Self.absoluteUserRPMRange.lowerBound, Int(greatestMinimum.rounded(.up)))
+        let upperBound = min(Self.absoluteUserRPMRange.upperBound, Int(smallestMaximum.rounded(.down)))
+        guard lowerBound <= upperBound else {
+            return Self.absoluteUserRPMRange
+        }
+        return lowerBound...upperBound
     }
 
     override init() {
         super.init()
-        userPresets = Self.loadUserPresets()
-        do {
-            reader = try SensorReader(smc: SMCConnection())
-            refresh()
-            timer = Timer.scheduledTimer(
-                timeInterval: refreshInterval,
-                target: self,
-                selector: #selector(timerDidFire),
-                userInfo: nil,
-                repeats: true
-            )
-            RunLoop.main.add(timer!, forMode: .common)
-        } catch {
-            errorMessage = error.localizedDescription
-            menuBarTitle = "mFanCtl -"
+        switch Self.loadUserPresets() {
+        case .loaded(let presets):
+            userPresets = presets
+        case .unreadable:
+            userPresets = []
+            setNotice(L10n.presetDataUnreadable, source: .presets)
         }
+        isLoadingUserPresets = false
+
+        refresh()
+        timer = Timer.scheduledTimer(
+            timeInterval: refreshInterval,
+            target: self,
+            selector: #selector(timerDidFire),
+            userInfo: nil,
+            repeats: true
+        )
+        RunLoop.main.add(timer!, forMode: .common)
         refreshHelperState()
     }
 
     func invalidateTimers() {
         timer?.invalidate()
         timer = nil
+        sensorRefreshTask?.cancel()
+        sensorRefreshTask = nil
+        helperProbeTask?.cancel()
+        helperProbeTask = nil
+        helperPreparationTask?.cancel()
+        helperPreparationTask = nil
+        controlTask?.cancel()
+        controlTask = nil
+        safetyRecoveryTask?.cancel()
+        safetyRecoveryTask = nil
+        stopManualControlMaintenance()
     }
 
     func prepareHelper() {
@@ -2586,43 +2743,118 @@ final class FanCtlMenuBarModel: NSObject {
     }
 
     func refresh() {
-        guard let reader else {
-            errorMessage = L10n.smcConnectionFailed
-            menuBarTitle = "mFanCtl -"
+        guard sensorRefreshTask == nil else {
             return
         }
 
-        let nextSnapshot = reader.snapshot()
-        snapshot = nextSnapshot
-        menuBarTitle = title(for: nextSnapshot, format: menuBarTitleFormat)
+        let sampler = sensorSampler
+        let observationGeneration = controlGeneration
+        let canReconcileObservedState = controlTask == nil &&
+            safetyRecoveryTask == nil &&
+            helperPreparationTask == nil
+        sensorRefreshTask = Task { [weak self] in
+            do {
+                let nextSnapshot = try await sampler.snapshot()
+                try Task.checkCancellation()
+                guard let self else {
+                    return
+                }
+                snapshot = nextSnapshot
+                menuBarTitle = title(for: nextSnapshot, format: menuBarTitleFormat)
+                if nextSnapshot.fans.isEmpty {
+                    setNotice(L10n.noFansFound, source: .sensor)
+                } else {
+                    setNotice(nil, source: .sensor)
+                    if canReconcileObservedState,
+                       observationGeneration == controlGeneration {
+                        reconcileObservedFanState(nextSnapshot)
+                    }
+                }
+            } catch is CancellationError {
+                // App shutdown or a superseded refresh.
+            } catch {
+                guard let self else {
+                    return
+                }
+                setNotice(error.localizedDescription, source: .sensor)
+                if snapshot == nil {
+                    menuBarTitle = "mFanCtl -"
+                }
+            }
+            self?.sensorRefreshTask = nil
+        }
     }
 
     func applyPresetSelection(_ preset: FanPreset) {
+        safetyRecoveryPending = false
+        safetyRecoveryTask?.cancel()
+        safetyRecoveryTask = nil
         applyPreset(preset)
     }
 
     func applyAutomaticForSleepOrLidClose() {
-        Task {
-            await restoreAutomatic(reason: "sleep or lid close")
+        safetyRecoveryPending = true
+        startSafetyRecoveryIfNeeded()
+    }
+
+    func ensureAutomaticWhileLidClosed() {
+        guard safetyRecoveryPending || selectedPreset != .automatic || pendingPreset != nil else {
+            return
         }
+        applyAutomaticForSleepOrLidClose()
     }
 
     func restoreAutomaticForAppTermination() async {
-        await restoreAutomatic(reason: "app termination")
+        safetyRecoveryPending = false
+        controlGeneration += 1
+        pendingPreset = nil
+        controlTask?.cancel()
+        safetyRecoveryTask?.cancel()
+        stopManualControlMaintenance()
+        let mutationSequence = FanCtlHelperClient.nextMutationSequence()
+        _ = await restoreAutomatic(
+            reason: "app termination",
+            showsFailure: false,
+            expectedGeneration: controlGeneration,
+            mutationSequence: mutationSequence
+        )
     }
 
-    private func restoreAutomatic(reason: String) async {
+    @discardableResult
+    private func restoreAutomatic(
+        reason: String,
+        showsFailure: Bool,
+        expectedGeneration: Int,
+        mutationSequence: Int64
+    ) async -> Bool {
         do {
             _ = try await FanCtlHelperClient.send(
                 "SET_AUTOMATIC",
-                timeout: FanCtlHelperClient.automaticFallbackTimeout
+                timeout: FanCtlHelperClient.automaticFallbackTimeout,
+                mutationSequence: mutationSequence
             )
+            try Task.checkCancellation()
+            guard expectedGeneration == controlGeneration else {
+                return true
+            }
             helperState = .available
             requiresHelperApproval = false
-            errorMessage = nil
+            setNotice(nil, source: .control)
+            setNotice(nil, source: .mode)
+            setNotice(nil, source: .lease)
+            setNotice(nil, source: .helper)
+            setNotice(nil, source: .permission)
             selectedPreset = .automatic
+            manualLeaseFailureCount = 0
+            refresh()
+            return true
         } catch {
             NSLog("mFanCtl failed to restore automatic fan mode for \(reason): \(error.localizedDescription)")
+            if showsFailure, expectedGeneration == controlGeneration, !Task.isCancelled {
+                setNotice(error.localizedDescription, source: .control)
+                selectedPreset = nil
+            }
+            return false
         }
     }
 
@@ -2645,9 +2877,11 @@ final class FanCtlMenuBarModel: NSObject {
     }
 
     func deleteUserPreset(id: UUID) {
+        let wasSelectedOrPending = selectedPreset == .custom(id) || pendingPreset == .custom(id)
         userPresets.removeAll { $0.id == id }
-        if selectedPreset == .custom(id) {
-            selectedPreset = .automatic
+        if wasSelectedOrPending {
+            selectedPreset = nil
+            applyPreset(.automatic)
         }
     }
 
@@ -2656,9 +2890,14 @@ final class FanCtlMenuBarModel: NSObject {
             return
         }
 
+        let wasSelectedOrPending = selectedPreset == .custom(id) || pendingPreset == .custom(id)
+        let previousRPM = userPresets[index].rpm
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         userPresets[index].name = trimmedName.isEmpty ? L10n.presetBaseName : trimmedName
         userPresets[index].rpm = max(validUserRPMRange.lowerBound, min(validUserRPMRange.upperBound, rpm))
+        if wasSelectedOrPending, userPresets[index].rpm != previousRPM {
+            applyPreset(.custom(id))
+        }
     }
 
     func updateMenuBarTitleFormat(_ format: String) {
@@ -2788,169 +3027,541 @@ final class FanCtlMenuBarModel: NSObject {
         UserDefaults.standard.set(data, forKey: Self.userPresetsKey)
     }
 
-    private static func loadUserPresets() -> [UserFanPreset] {
-        guard let data = UserDefaults.standard.data(forKey: userPresetsKey),
-              let presets = try? JSONDecoder().decode([UserFanPreset].self, from: data)
-        else {
-            return []
+    private static func loadUserPresets() -> StoredPresetLoadResult {
+        guard let data = UserDefaults.standard.data(forKey: userPresetsKey) else {
+            return .loaded([])
         }
-        return presets.map {
-            UserFanPreset(id: $0.id, name: $0.name, rpm: max(1, $0.rpm))
+        guard let presets = try? JSONDecoder().decode([UserFanPreset].self, from: data) else {
+            return .unreadable
         }
+
+        var identifiers = Set<UUID>()
+        var validated: [UserFanPreset] = []
+        validated.reserveCapacity(presets.count)
+        for preset in presets {
+            guard identifiers.insert(preset.id).inserted,
+                  absoluteUserRPMRange.contains(preset.rpm)
+            else {
+                return .unreadable
+            }
+            let trimmedName = preset.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            validated.append(UserFanPreset(
+                id: preset.id,
+                name: trimmedName.isEmpty ? L10n.presetBaseName : trimmedName,
+                rpm: preset.rpm
+            ))
+        }
+        return .loaded(validated)
     }
 
     @objc private func timerDidFire() {
         refresh()
         refreshHelperState()
-    }
-
-    private func applyPreset(_ preset: FanPreset) {
-        switch helperState {
-        case .unknown, .available:
-            applyPresetUsingHelper(preset)
-        case .unavailable:
-            installHelper(thenApply: preset)
-        case .installing:
-            errorMessage = L10n.installingPermission
+        if safetyRecoveryPending {
+            startSafetyRecoveryIfNeeded()
         }
     }
 
-    private func applyPresetUsingHelper(_ preset: FanPreset) {
-        errorMessage = nil
-        requiresHelperApproval = false
+    private func applyPreset(_ preset: FanPreset) {
+        safetyRecoveryPending = false
+        safetyRecoveryTask?.cancel()
+        safetyRecoveryTask = nil
+        if let selectedPreset, selectedPreset != .automatic {
+            startManualControlMaintenance()
+        }
+        // Keep the current manual lease alive until Automatic is actually
+        // verified. If the command fails, the checked preset still describes
+        // the state we are maintaining.
+        cancelManualLeaseRenewal()
+        controlGeneration += 1
+        let generation = controlGeneration
+        let mutationSequence = FanCtlHelperClient.nextMutationSequence()
+        pendingPreset = preset
+        controlTask?.cancel()
+        setNotice(L10n.applyingFanPreset, source: .control)
+        setNotice(nil, source: .lease)
+        setNotice(nil, source: .mode)
 
-        Task {
+        controlTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
             do {
-                try await sendHelperCommand(for: preset, waitForAvailability: true)
+                try await ensureHelperAvailableForControl()
+                try Task.checkCancellation()
+                try await sendHelperCommand(for: preset, mutationSequence: mutationSequence)
+                try Task.checkCancellation()
+                guard generation == controlGeneration else {
+                    return
+                }
                 helperState = .available
+                helperProbeFailureCount = 0
                 requiresHelperApproval = false
+                setNotice(nil, source: .permission)
+                setNotice(nil, source: .helper)
+                setNotice(nil, source: .control)
                 selectedPreset = preset
+                pendingPreset = nil
+                manualLeaseFailureCount = 0
+                controlTask = nil
                 refresh()
-            } catch FanCtlHelperClient.Error.unavailable {
+            } catch is CancellationError {
+                // A newer preset or a safety fallback superseded this request.
+            } catch InstallError.requiresApproval {
+                guard generation == controlGeneration else {
+                    return
+                }
+                setNotice(nil, source: .control)
+                let shouldPrompt = !requiresHelperApproval
                 helperState = .unavailable
-                installHelper(thenApply: preset)
+                requiresHelperApproval = true
+                setNotice(InstallError.requiresApproval.localizedDescription, source: .permission)
+                if shouldPrompt {
+                    didRequireHelperApproval?()
+                }
+                NSLog("mFanCtl fan helper requires approval")
             } catch {
-                errorMessage = error.localizedDescription
+                guard generation == controlGeneration else {
+                    return
+                }
+                if case FanCtlHelperClient.Error.unavailable = error {
+                    setNotice(nil, source: .control)
+                    helperState = .unavailable
+                    setNotice(error.localizedDescription, source: .helper)
+                } else {
+                    setNotice(error.localizedDescription, source: .control)
+                }
+                NSLog("mFanCtl failed to apply fan preset: \(error.localizedDescription)")
+            }
+
+            if generation == controlGeneration {
+                pendingPreset = nil
+                controlTask = nil
             }
         }
     }
 
-    private func sendHelperCommand(for preset: FanPreset, waitForAvailability: Bool = false) async throws {
-        let command = switch preset {
+    @objc private func manualLeaseTimerDidFire() {
+        renewManualLeaseIfNeeded()
+    }
+
+    private func startManualControlMaintenance() {
+        if manualControlActivity == nil {
+            manualControlActivity = ProcessInfo.processInfo.beginActivity(
+                options: .userInitiatedAllowingIdleSystemSleep,
+                reason: "Maintain the user-selected manual fan mode"
+            )
+        }
+
+        guard manualLeaseTimer == nil else {
+            return
+        }
+
+        let timer = Timer(
+            timeInterval: FanCtlHelperConstants.manualControlHeartbeatInterval,
+            target: self,
+            selector: #selector(manualLeaseTimerDidFire),
+            userInfo: nil,
+            repeats: true
+        )
+        timer.tolerance = min(0.5, FanCtlHelperConstants.manualControlHeartbeatInterval / 10)
+        manualLeaseTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopManualControlMaintenance() {
+        manualLeaseTimer?.invalidate()
+        manualLeaseTimer = nil
+        cancelManualLeaseRenewal()
+
+        if let manualControlActivity {
+            ProcessInfo.processInfo.endActivity(manualControlActivity)
+            self.manualControlActivity = nil
+        }
+    }
+
+    private func cancelManualLeaseRenewal() {
+        manualLeaseRenewalGeneration &+= 1
+        manualLeaseRenewalTask?.cancel()
+        manualLeaseRenewalTask = nil
+    }
+
+    private func sendHelperCommand(for preset: FanPreset, mutationSequence: Int64) async throws {
+        let command: String
+        switch preset {
         case .automatic:
-            "SET_AUTOMATIC"
+            command = "SET_AUTOMATIC"
         case .maximum:
-            "SET_MAXIMUM"
+            command = "SET_MAXIMUM"
         case .custom(let id):
             if let preset = userPresets.first(where: { $0.id == id }) {
-                "SET_RPM \(preset.rpm)"
+                guard validUserRPMRange.contains(preset.rpm) else {
+                    throw FanCtlMenuError.invalidPresetRPM(validUserRPMRange)
+                }
+                command = "SET_RPM \(preset.rpm)"
             } else {
                 throw FanCtlMenuError.missingPreset
             }
         }
 
-        if waitForAvailability {
-            try await FanCtlHelperClient.waitUntilAvailable(timeout: 2.0)
-        }
-        _ = try await FanCtlHelperClient.send(command, timeout: FanCtlHelperClient.fanCommandTimeout)
+        _ = try await FanCtlHelperClient.send(
+            command,
+            timeout: FanCtlHelperClient.fanCommandTimeout,
+            mutationSequence: mutationSequence
+        )
     }
 
-    private func installHelper(thenApply preset: FanPreset? = nil) {
-        guard helperState != .installing else {
-            errorMessage = L10n.installingPermission
+    private func ensureHelperAvailableForControl() async throws {
+        if let helperPreparationTask {
+            setNotice(L10n.installingPermission, source: .helper)
+            await helperPreparationTask.value
+            try Task.checkCancellation()
+        }
+
+        let requiresReinstall: Bool
+        do {
+            try await FanCtlHelperClient.waitUntilAvailable(timeout: 1.0)
+            helperState = .available
+            helperProbeFailureCount = 0
             return
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch FanCtlHelperClient.Error.incompatibleHelper {
+            requiresReinstall = true
+        } catch {
+            // Registration below also refreshes an outdated bundled helper.
+            requiresReinstall = false
         }
 
         helperState = .installing
         requiresHelperApproval = false
-        errorMessage = L10n.installingPermission
+        setNotice(nil, source: .permission)
+        setNotice(L10n.installingPermission, source: .helper)
 
-        Task {
-            do {
-                try await Task.detached {
-                    try FanCtlHelperInstaller.install()
-                }.value
-                try await waitForHelperAvailability()
-                helperState = .available
-                requiresHelperApproval = false
-                errorMessage = nil
-                if let preset {
-                    try await sendHelperCommand(for: preset, waitForAvailability: false)
-                    selectedPreset = preset
-                    refresh()
-                }
-            } catch InstallError.requiresApproval {
-                helperState = .unavailable
-                requiresHelperApproval = true
-                errorMessage = InstallError.requiresApproval.localizedDescription
-                NSLog("mFanCtl fan helper requires approval")
-                SMAppService.openSystemSettingsLoginItems()
-            } catch {
-                helperState = .unavailable
-                requiresHelperApproval = false
-                errorMessage = error.localizedDescription
-                NSLog("mFanCtl failed to prepare fan helper: \(error.localizedDescription)")
+        try await Task.detached {
+            if requiresReinstall {
+                try FanCtlHelperInstaller.reinstall()
+            } else {
+                try FanCtlHelperInstaller.install()
             }
+        }.value
+        try Task.checkCancellation()
+        do {
+            try await waitForHelperAvailability()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            guard !requiresReinstall else {
+                throw error
+            }
+            try await Task.detached {
+                try FanCtlHelperInstaller.reinstall()
+            }.value
+            try Task.checkCancellation()
+            try await waitForHelperAvailability()
+        }
+        helperState = .available
+        helperProbeFailureCount = 0
+        setNotice(nil, source: .helper)
+    }
+
+    private func renewManualLeaseIfNeeded() {
+        guard !safetyRecoveryPending,
+              controlTask == nil,
+              safetyRecoveryTask == nil,
+              manualLeaseRenewalTask == nil,
+              let selectedPreset,
+              selectedPreset != .automatic
+        else {
+            return
+        }
+
+        let expectedPreset = selectedPreset
+        let expectedControlGeneration = controlGeneration
+        let mutationSequence = FanCtlHelperClient.nextMutationSequence()
+        manualLeaseRenewalGeneration &+= 1
+        let renewalGeneration = manualLeaseRenewalGeneration
+        manualLeaseRenewalTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+            defer {
+                if renewalGeneration == manualLeaseRenewalGeneration {
+                    manualLeaseRenewalTask = nil
+                }
+            }
+            do {
+                _ = try await FanCtlHelperClient.send(
+                    "RENEW_MANUAL_LEASE",
+                    timeout: 3.0,
+                    mutationSequence: mutationSequence
+                )
+                try Task.checkCancellation()
+                guard renewalGeneration == manualLeaseRenewalGeneration,
+                      expectedControlGeneration == controlGeneration,
+                      self.selectedPreset == expectedPreset else {
+                    return
+                }
+                manualLeaseFailureCount = 0
+                setNotice(nil, source: .lease)
+            } catch is CancellationError {
+                // Automatic mode or a newer command stopped the heartbeat.
+            } catch {
+                guard renewalGeneration == manualLeaseRenewalGeneration,
+                      expectedControlGeneration == controlGeneration,
+                      self.selectedPreset == expectedPreset else {
+                    return
+                }
+                manualLeaseFailureCount += 1
+                let leaseIsInactive: Bool
+                if case FanCtlHelperClient.Error.rejected(let code, _) = error {
+                    leaseIsInactive = code == "manual_lease_inactive"
+                } else {
+                    leaseIsInactive = false
+                }
+
+                if leaseIsInactive || manualLeaseFailureCount >= 2 {
+                    self.selectedPreset = nil
+                    setNotice(error.localizedDescription, source: .lease)
+                    safetyRecoveryPending = true
+                }
+            }
+            if safetyRecoveryPending {
+                startSafetyRecoveryIfNeeded()
+            }
+        }
+    }
+
+    private func startSafetyRecoveryIfNeeded() {
+        guard safetyRecoveryPending, safetyRecoveryTask == nil else {
+            return
+        }
+
+        controlGeneration += 1
+        let generation = controlGeneration
+        let mutationSequence = FanCtlHelperClient.nextMutationSequence()
+        pendingPreset = nil
+        controlTask?.cancel()
+        controlTask = nil
+        stopManualControlMaintenance()
+
+        safetyRecoveryTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+            let succeeded = await restoreAutomatic(
+                reason: "sleep or lid close",
+                showsFailure: true,
+                expectedGeneration: generation,
+                mutationSequence: mutationSequence
+            )
+            guard generation == controlGeneration else {
+                return
+            }
+            safetyRecoveryPending = !succeeded
+            safetyRecoveryTask = nil
         }
     }
 
     private func prepareHelperSilently() {
-        Task {
+        guard helperPreparationTask == nil else {
+            return
+        }
+
+        let generation = controlGeneration
+        helperPreparationTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
             do {
                 try await Task.detached {
                     try FanCtlHelperInstaller.install()
                 }.value
-                try await waitForHelperAvailability(timeout: 2.0)
-                guard helperState != .installing else {
-                    return
+                try Task.checkCancellation()
+                do {
+                    try await waitForHelperAvailability()
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    try await Task.detached {
+                        try FanCtlHelperInstaller.reinstall()
+                    }.value
+                    try Task.checkCancellation()
+                    try await waitForHelperAvailability()
                 }
                 helperState = .available
+                helperProbeFailureCount = 0
                 requiresHelperApproval = false
-                errorMessage = nil
-            } catch InstallError.requiresApproval {
-                guard helperState == .unknown || helperState == .unavailable else {
-                    return
+                setNotice(nil, source: .permission)
+                setNotice(nil, source: .helper)
+
+                if generation == controlGeneration {
+                    let mutationSequence = FanCtlHelperClient.nextMutationSequence()
+                    _ = await restoreAutomatic(
+                        reason: "app launch reconciliation",
+                        showsFailure: true,
+                        expectedGeneration: generation,
+                        mutationSequence: mutationSequence
+                    )
                 }
+            } catch is CancellationError {
+                // App shutdown.
+            } catch InstallError.requiresApproval {
                 helperState = .unavailable
                 requiresHelperApproval = true
-                errorMessage = InstallError.requiresApproval.localizedDescription
+                setNotice(InstallError.requiresApproval.localizedDescription, source: .permission)
                 didRequireHelperApproval?()
                 NSLog("mFanCtl fan helper requires approval")
             } catch {
-                guard helperState == .unknown || helperState == .unavailable else {
-                    return
-                }
                 helperState = .unavailable
                 requiresHelperApproval = false
+                setNotice(error.localizedDescription, source: .helper)
                 NSLog("mFanCtl silent fan helper preparation failed: \(error.localizedDescription)")
             }
+            helperPreparationTask = nil
         }
     }
 
-    private func refreshHelperState() {
-        guard helperState == .unknown || helperState == .available || helperState == .unavailable else {
+    private func refreshHelperState(now: Date = Date()) {
+        guard helperProbeTask == nil,
+              helperState == .unknown || helperState == .available || helperState == .unavailable
+        else {
             return
         }
 
-        Task {
-            let isAvailable = await helperIsAvailable(timeout: 0.4)
-            guard helperState == .unknown || helperState == .available || helperState == .unavailable else {
+        let minimumProbeInterval: TimeInterval = helperState == .available ? 10 : 4
+        if let lastHelperProbeDate,
+           now.timeIntervalSince(lastHelperProbeDate) < minimumProbeInterval {
+            return
+        }
+        lastHelperProbeDate = now
+
+        helperProbeTask = Task { [weak self] in
+            guard let self else {
                 return
             }
-            helperState = isAvailable ? .available : .unavailable
-            if isAvailable {
+            do {
+                try await FanCtlHelperClient.waitUntilAvailable(timeout: 0.75)
+                try Task.checkCancellation()
+                helperProbeFailureCount = 0
+                if helperState != .installing {
+                    helperState = .available
+                }
                 requiresHelperApproval = false
-                errorMessage = nil
+                setNotice(nil, source: .permission)
+                setNotice(nil, source: .helper)
+            } catch is CancellationError {
+                // App shutdown.
+            } catch {
+                helperProbeFailureCount += 1
+                if helperProbeFailureCount >= 3, helperState != .installing {
+                    helperState = .unavailable
+                    if !requiresHelperApproval {
+                        setNotice(error.localizedDescription, source: .helper)
+                    }
+                }
+            }
+            helperProbeTask = nil
+        }
+    }
+
+    private func reconcileObservedFanState(_ snapshot: SensorSnapshot) {
+        guard controlTask == nil,
+              safetyRecoveryTask == nil,
+              helperPreparationTask == nil
+        else {
+            return
+        }
+
+        let modes = snapshot.fans.compactMap(\.mode)
+        guard modes.count == snapshot.fans.count else {
+            selectedPreset = nil
+            setNotice(L10n.unknownFanModeDetected, source: .mode)
+            return
+        }
+
+        if modes.allSatisfy({ $0 == 0 || $0 == 3 }) {
+            if let fanTestMode = snapshot.fanTestMode, fanTestMode != 0 {
+                selectedPreset = nil
+                setNotice(L10n.fanTestModeActive, source: .mode)
+                return
+            }
+            selectedPreset = .automatic
+            setNotice(nil, source: .mode)
+            return
+        }
+
+        guard modes.allSatisfy({ $0 == 1 }) else {
+            selectedPreset = nil
+            setNotice(L10n.unknownFanModeDetected, source: .mode)
+            return
+        }
+
+        guard let selectedPreset, selectedPreset != .automatic else {
+            self.selectedPreset = nil
+            setNotice(L10n.manualFanModeDetected, source: .mode)
+            return
+        }
+
+        switch selectedManualPresetMatchesSnapshot(selectedPreset, fans: snapshot.fans) {
+        case .some(true):
+            setNotice(nil, source: .mode)
+        case .some(false):
+            self.selectedPreset = nil
+            setNotice(L10n.presetNoLongerApplied, source: .mode)
+        case .none:
+            self.selectedPreset = nil
+            setNotice(L10n.unknownFanModeDetected, source: .mode)
+        }
+    }
+
+    private func selectedManualPresetMatchesSnapshot(_ preset: FanPreset, fans: [FanSnapshot]) -> Bool? {
+        switch preset {
+        case .automatic:
+            return false
+        case .maximum:
+            guard fans.allSatisfy({ $0.targetRPM != nil && $0.maximumRPM != nil }) else {
+                return nil
+            }
+            return fans.allSatisfy { fan in
+                guard let target = fan.targetRPM, let maximum = fan.maximumRPM else {
+                    return false
+                }
+                return Self.rpmValuesMatch(target, maximum)
+            }
+        case .custom(let id):
+            guard let requestedRPM = userPresets.first(where: { $0.id == id })?.rpm,
+                  fans.allSatisfy({ $0.targetRPM != nil })
+            else {
+                return nil
+            }
+            return fans.allSatisfy { fan in
+                guard let target = fan.targetRPM else {
+                    return false
+                }
+                return Self.rpmValuesMatch(target, Double(requestedRPM))
             }
         }
     }
 
-    private func helperIsAvailable(timeout: TimeInterval) async -> Bool {
-        do {
-            try await FanCtlHelperClient.waitUntilAvailable(timeout: timeout)
-            return true
-        } catch {
+    private static func rpmValuesMatch(_ lhs: Double, _ rhs: Double) -> Bool {
+        guard lhs.isFinite, rhs.isFinite else {
             return false
+        }
+        return abs(lhs - rhs) <= max(25, abs(rhs) * 0.02)
+    }
+
+    private func setNotice(_ message: String?, source: NoticeSource) {
+        let normalized = message?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let normalized, !normalized.isEmpty {
+            notices[source] = normalized
+        } else {
+            notices.removeValue(forKey: source)
+        }
+
+        let nextMessage = NoticeSource.allCases.compactMap { notices[$0] }.first
+        if nextMessage != errorMessage {
+            errorMessage = nextMessage
         }
     }
 
@@ -3024,6 +3635,7 @@ private enum FanCtlMenuError: LocalizedError {
     case smcUnavailable
     case noFans
     case missingPreset
+    case invalidPresetRPM(ClosedRange<Int>)
 
     var errorDescription: String? {
         switch self {
@@ -3033,6 +3645,8 @@ private enum FanCtlMenuError: LocalizedError {
             L10n.noFansFound
         case .missingPreset:
             L10n.missingPreset
+        case .invalidPresetRPM(let range):
+            L10n.invalidRPMMessage(range: range)
         }
     }
 }

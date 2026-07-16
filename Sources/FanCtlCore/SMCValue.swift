@@ -16,18 +16,21 @@ public struct SMCValue: Sendable {
     }
 
     public var numericValue: Double? {
-        guard dataSize > 0 else {
+        guard resultCode == 0,
+              dataSize > 0,
+              Int(dataSize) == bytes.count else {
             return nil
         }
 
         switch dataType {
         case "ui8 ":
-            return Double(bytes[safe: 0] ?? 0)
+            guard dataSize == 1 else { return nil }
+            return Double(bytes[0])
         case "ui16":
-            guard bytes.count >= 2 else { return nil }
+            guard dataSize == 2 else { return nil }
             return Double(UInt16(bytes[0]) << 8 | UInt16(bytes[1]))
         case "ui32":
-            guard bytes.count >= 4 else { return nil }
+            guard dataSize == 4 else { return nil }
             return Double(
                 UInt32(bytes[0]) << 24 |
                 UInt32(bytes[1]) << 16 |
@@ -57,7 +60,7 @@ public struct SMCValue: Sendable {
         case "spf0":
             return fixedPoint(divisor: 1)
         case "flt ":
-            guard bytes.count >= 4 else { return nil }
+            guard dataSize == 4 else { return nil }
             let bitPattern = UInt32(bytes[0])
                 | UInt32(bytes[1]) << 8
                 | UInt32(bytes[2]) << 16
@@ -66,22 +69,18 @@ public struct SMCValue: Sendable {
             guard value.isFinite else { return nil }
             return Double(value)
         case "fpe2":
-            guard bytes.count >= 2 else { return nil }
-            return Double((Int(bytes[0]) << 6) + (Int(bytes[1]) >> 2))
+            guard dataSize == 2 else { return nil }
+            let raw = UInt16(bytes[0]) << 8 | UInt16(bytes[1])
+            return Double(raw) / 4
         default:
             return nil
         }
     }
 
     private func fixedPoint(divisor: Double) -> Double? {
-        guard bytes.count >= 2 else { return nil }
-        let raw = Int(bytes[0]) * 256 + Int(bytes[1])
+        guard dataSize == 2 else { return nil }
+        let bitPattern = UInt16(bytes[0]) << 8 | UInt16(bytes[1])
+        let raw = Int16(bitPattern: bitPattern)
         return Double(raw) / divisor
-    }
-}
-
-private extension Array where Element == UInt8 {
-    subscript(safe index: Int) -> UInt8? {
-        indices.contains(index) ? self[index] : nil
     }
 }

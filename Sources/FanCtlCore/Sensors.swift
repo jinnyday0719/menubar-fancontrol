@@ -24,15 +24,17 @@ public struct SensorSnapshot: Sendable {
     public let hardware: HardwareProfile
     public let gpuTemperature: GPUTemperatureSnapshot?
     public let fans: [FanSnapshot]
+    public let fanTestMode: Int?
+    public let fanReadError: String?
 }
 
 public final class SensorReader: Sendable {
     private static let plausibleGPUTemperatureRange = 10.0..<130.0
 
-    private let smc: SMCConnection
+    private let smc: any SMCClient
     private let hardware: HardwareProfile
 
-    public init(smc: SMCConnection, hardware: HardwareProfile = .current) {
+    public init(smc: any SMCClient, hardware: HardwareProfile = .current) {
         self.smc = smc
         self.hardware = hardware
     }
@@ -42,10 +44,33 @@ public final class SensorReader: Sendable {
     }
 
     public func snapshot() -> SensorSnapshot {
+        let gpuTemperature = readGPUTemperature()
+        do {
+            return SensorSnapshot(
+                hardware: hardware,
+                gpuTemperature: gpuTemperature,
+                fans: try readFansStrict(),
+                fanTestMode: try readOptionalInteger("Ftst"),
+                fanReadError: nil
+            )
+        } catch {
+            return SensorSnapshot(
+                hardware: hardware,
+                gpuTemperature: gpuTemperature,
+                fans: [],
+                fanTestMode: nil,
+                fanReadError: error.localizedDescription
+            )
+        }
+    }
+
+    public func snapshotStrict() throws -> SensorSnapshot {
         SensorSnapshot(
             hardware: hardware,
             gpuTemperature: readGPUTemperature(),
-            fans: readFans()
+            fans: try readFansStrict(),
+            fanTestMode: try readOptionalInteger("Ftst"),
+            fanReadError: nil
         )
     }
 
@@ -71,34 +96,69 @@ public final class SensorReader: Sendable {
         )
     }
 
-    public func readFans() -> [FanSnapshot] {
-        guard let count = smc.numericValue(for: "FNum"), count > 0 else {
-            return []
+    public func readFans() throws -> [FanSnapshot] {
+        try readFansStrict()
+    }
+
+    public func readFansStrict() throws -> [FanSnapshot] {
+        let rawCount = try readNumeric("FNum")
+        guard rawCount >= 0,
+              rawCount <= 10,
+              rawCount.rounded(.towardZero) == rawCount else {
+            throw FanControlError.invalidFanCount(rawCount)
         }
 
-        return (0..<Int(count)).compactMap { index in
-            guard let actual = smc.numericValue(for: "F\(index)Ac") else {
-                return nil
-            }
-
+        return try (0..<Int(rawCount)).map { index in
             return FanSnapshot(
                 index: index,
-                actualRPM: actual,
-                targetRPM: smc.numericValue(for: "F\(index)Tg"),
-                minimumRPM: smc.numericValue(for: "F\(index)Mn"),
-                maximumRPM: smc.numericValue(for: "F\(index)Mx"),
-                mode: readFanMode(index: index)
+                actualRPM: try readNumeric("F\(index)Ac"),
+                targetRPM: try readOptionalNumeric("F\(index)Tg"),
+                minimumRPM: try readOptionalNumeric("F\(index)Mn"),
+                maximumRPM: try readOptionalNumeric("F\(index)Mx"),
+                mode: try readFanModeStrict(index: index)
             )
         }
     }
 
-    private func readFanMode(index: Int) -> Int? {
-        if let lower = smc.numericValue(for: "F\(index)md") {
-            return Int(lower)
+    private func readFanModeStrict(index: Int) throws -> Int? {
+        do {
+            return try integerValue("F\(index)md")
+        } catch SMCError.firmwareRejected(_, let code) where code == 0x84 {
+            return try readOptionalInteger("F\(index)Md")
         }
-        if let upper = smc.numericValue(for: "F\(index)Md") {
-            return Int(upper)
+    }
+
+    private func readNumeric(_ key: String) throws -> Double {
+        let value = try smc.read(key)
+        guard let numeric = value.numericValue, numeric.isFinite else {
+            throw SMCError.invalidNumericValue(key: key)
         }
-        return nil
+        return numeric
+    }
+
+    private func readOptionalNumeric(_ key: String) throws -> Double? {
+        do {
+            return try readNumeric(key)
+        } catch SMCError.firmwareRejected(_, let code) where code == 0x84 {
+            return nil
+        }
+    }
+
+    private func integerValue(_ key: String) throws -> Int {
+        let numeric = try readNumeric(key)
+        guard numeric.rounded(.towardZero) == numeric,
+              numeric >= Double(Int.min),
+              numeric <= Double(Int.max) else {
+            throw SMCError.invalidNumericValue(key: key)
+        }
+        return Int(numeric)
+    }
+
+    private func readOptionalInteger(_ key: String) throws -> Int? {
+        do {
+            return try integerValue(key)
+        } catch SMCError.firmwareRejected(_, let code) where code == 0x84 {
+            return nil
+        }
     }
 }

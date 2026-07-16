@@ -8,6 +8,9 @@ public enum SMCError: Error, LocalizedError, Sendable {
     case writeFailed(key: String, kern_return_t)
     case firmwareRejected(key: String, UInt8)
     case invalidKey(String)
+    case invalidDataSize(key: String, expected: String, actual: Int)
+    case invalidDataType(key: String, UInt32)
+    case invalidNumericValue(key: String)
 
     public var errorDescription: String? {
         switch self {
@@ -23,6 +26,12 @@ public enum SMCError: Error, LocalizedError, Sendable {
             "SMC firmware rejected key \(key): 0x\(String(format: "%02x", code))"
         case .invalidKey(let key):
             "SMC key must be exactly 4 ASCII characters: \(key)"
+        case .invalidDataSize(let key, let expected, let actual):
+            "SMC key \(key) has invalid data size \(actual); expected \(expected)."
+        case .invalidDataType(let key, let dataType):
+            "SMC key \(key) returned an invalid data type: 0x\(String(format: "%08x", dataType))"
+        case .invalidNumericValue(let key):
+            "SMC key \(key) did not contain a valid numeric value."
         }
     }
 
@@ -80,6 +89,9 @@ private struct SMCKeyData {
     var version = Version()
     var pLimitData = LimitData()
     var keyInfo = KeyInfo()
+    // Swift embeds KeyInfo using its 9-byte size rather than its 12-byte C stride.
+    // Together with Swift's alignment byte, this field recreates the three bytes
+    // of C tail padding so result/data8/data32/bytes stay at 40/42/44/48.
     var padding: UInt16 = 0
     var result: UInt8 = 0
     var status: UInt8 = 0
@@ -96,7 +108,13 @@ private struct SMCKeyData {
 public final class SMCConnection: SMCClient, @unchecked Sendable {
     public let serviceName: String
     public static let parameterStructSize = MemoryLayout<SMCKeyData>.stride
+    static let parameterResultOffset = MemoryLayout<SMCKeyData>.offset(of: \.result)
+    static let parameterStatusOffset = MemoryLayout<SMCKeyData>.offset(of: \.status)
+    static let parameterCommandOffset = MemoryLayout<SMCKeyData>.offset(of: \.data8)
+    static let parameterData32Offset = MemoryLayout<SMCKeyData>.offset(of: \.data32)
+    static let parameterPayloadOffset = MemoryLayout<SMCKeyData>.offset(of: \.bytes)
     private let connection: io_connect_t
+    private let callLock = NSRecursiveLock()
 
     public init() throws {
         var lastOpenResult: kern_return_t?
@@ -143,7 +161,10 @@ public final class SMCConnection: SMCClient, @unchecked Sendable {
     }
 
     public func read(_ key: String) throws -> SMCValue {
-        guard key.utf8.count == 4 else {
+        callLock.lock()
+        defer { callLock.unlock() }
+
+        guard key.utf8.count == 4, key.utf8.allSatisfy({ $0 < 0x80 }) else {
             throw SMCError.invalidKey(key)
         }
 
@@ -161,6 +182,16 @@ public final class SMCConnection: SMCClient, @unchecked Sendable {
         }
 
         let keyInfo = output.keyInfo
+        guard (1...32).contains(Int(keyInfo.dataSize)) else {
+            throw SMCError.invalidDataSize(
+                key: key,
+                expected: "1...32 bytes",
+                actual: Int(keyInfo.dataSize)
+            )
+        }
+        guard let dataType = keyInfo.dataType.smcString else {
+            throw SMCError.invalidDataType(key: key, keyInfo.dataType)
+        }
         input.keyInfo.dataSize = keyInfo.dataSize
         input.data8 = SMCCommand.readBytes.rawValue
 
@@ -174,7 +205,7 @@ public final class SMCConnection: SMCClient, @unchecked Sendable {
 
         return SMCValue(
             key: key,
-            dataType: keyInfo.dataType.smcString,
+            dataType: dataType,
             dataSize: keyInfo.dataSize,
             resultCode: output.result,
             bytes: bytesArray(output.bytes).prefix(Int(keyInfo.dataSize)).map { $0 }
@@ -186,11 +217,29 @@ public final class SMCConnection: SMCClient, @unchecked Sendable {
     }
 
     public func write(_ key: String, bytes: [UInt8]) throws {
-        guard key.utf8.count == 4 else {
+        callLock.lock()
+        defer { callLock.unlock() }
+
+        guard key.utf8.count == 4, key.utf8.allSatisfy({ $0 < 0x80 }) else {
             throw SMCError.invalidKey(key)
         }
 
         let existing = try read(key)
+        let expectedSize = Int(existing.dataSize)
+        guard (1...32).contains(expectedSize) else {
+            throw SMCError.invalidDataSize(
+                key: key,
+                expected: "1...32 bytes",
+                actual: expectedSize
+            )
+        }
+        guard bytes.count == expectedSize else {
+            throw SMCError.invalidDataSize(
+                key: key,
+                expected: "exactly \(expectedSize) bytes",
+                actual: bytes.count
+            )
+        }
 
         var input = SMCKeyData()
         var output = SMCKeyData()
@@ -232,13 +281,17 @@ private extension FourCharCode {
 }
 
 private extension UInt32 {
-    var smcString: String {
-        String(bytes: [
+    var smcString: String? {
+        let bytes = [
             UInt8((self >> 24) & 0xff),
             UInt8((self >> 16) & 0xff),
             UInt8((self >> 8) & 0xff),
             UInt8(self & 0xff)
-        ], encoding: .ascii) ?? ""
+        ]
+        guard bytes.allSatisfy({ (0x20...0x7e).contains($0) }) else {
+            return nil
+        }
+        return String(bytes: bytes, encoding: .ascii)
     }
 }
 
