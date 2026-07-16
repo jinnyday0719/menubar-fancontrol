@@ -7,7 +7,10 @@ enum FanCtlHelperClient {
     // A complete transaction can wait up to roughly ten seconds per fan for
     // firmware to release manual mode. Keep this above the ten-fan core limit.
     static let fanCommandTimeout: TimeInterval = 120.0
-    static let automaticFallbackTimeout: TimeInterval = 5.0
+    // Automatic recovery retries mode changes for every enumerated fan and
+    // verifies Ftst afterward. Do not time out while the helper still owns the
+    // serialized mutation and is actively restoring the safe state.
+    static let automaticFallbackTimeout: TimeInterval = 20.0
     private static let sequenceGenerator = MutationSequenceGenerator()
 
     enum Error: LocalizedError {

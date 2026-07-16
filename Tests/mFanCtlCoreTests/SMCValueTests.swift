@@ -104,9 +104,182 @@ final class SMCValueTests: XCTestCase {
         ])
         smc.rejectedWriteKeys = ["F0Tg"]
 
-        XCTAssertThrowsError(try FanController(smc: smc).setManual(fanIndex: 0, rpm: 5000))
+        XCTAssertThrowsError(
+            try FanController(smc: smc, timing: .immediate).setManual(fanIndex: 0, rpm: 5000)
+        )
         XCTAssertTrue(smc.writes.contains { $0.key == "F0Md" && $0.bytes == [1] })
         XCTAssertTrue(smc.writes.contains { $0.key == "F0Md" && $0.bytes == [0] })
+    }
+
+    func testDelayedTargetReadbackIsRetriedWithoutWaitingForActualRPM() throws {
+        var values = standardFanValues(mode: 3, forceTest: 0)
+        values["F0Ac"] = fpe2("F0Ac", 2_317)
+        values["F0Mn"] = fpe2("F0Mn", 2_317)
+        values["F0Mx"] = fpe2("F0Mx", 5_072)
+        values["F0Tg"] = fpe2("F0Tg", 2_317)
+        let smc = FakeSMCClient(values: values)
+        smc.manualModeRequiresForceTest = true
+        smc.staleReadCountForNextWrite["F0Tg"] = 4
+        let timing = FanControlTiming(
+            forceTestWriteAttempts: 2,
+            forceTestWriteDelay: 0,
+            forceTestActivationDelay: 0,
+            manualModeWriteAttempts: 2,
+            manualModeWriteDelay: 0,
+            targetWriteAttempts: 4,
+            targetWriteDelay: 0
+        )
+
+        let result = try FanController(smc: smc, timing: timing).setManual(
+            fanIndex: 0,
+            rpm: 5_072
+        )
+
+        XCTAssertEqual(result.appliedRPM, 5_072)
+        XCTAssertEqual(try smc.read("F0Ac").numericValue, 2_317)
+        XCTAssertEqual(try smc.read("F0Tg").numericValue, 5_072)
+        XCTAssertEqual(try smc.read("F0Md").numericValue, 1)
+        XCTAssertEqual(try smc.read("Ftst").numericValue, 1)
+        XCTAssertGreaterThan(smc.writes.filter { $0.key == "F0Tg" }.count, 1)
+        XCTAssertFalse(smc.writes.contains { $0.key == "F0Md" && $0.bytes == [0] })
+    }
+
+    func testTargetRetryExhaustionRestoresAutomaticControl() throws {
+        var values = standardFanValues(mode: 0, forceTest: 0)
+        values["F0Tg"] = fpe2("F0Tg", 2_317)
+        let smc = FakeSMCClient(values: values)
+        smc.ignoreWrites(key: "F0Tg", bytes: [0x4e, 0x20], attempts: 10)
+        let timing = FanControlTiming(
+            forceTestWriteAttempts: 2,
+            forceTestWriteDelay: 0,
+            forceTestActivationDelay: 0,
+            manualModeWriteAttempts: 2,
+            manualModeWriteDelay: 0,
+            targetWriteAttempts: 3,
+            targetWriteDelay: 0
+        )
+
+        XCTAssertThrowsError(
+            try FanController(smc: smc, timing: timing).setManual(fanIndex: 0, rpm: 5_000)
+        ) { error in
+            guard case FanControlError.targetVerificationFailed(
+                fanIndex: 0,
+                expected: 5_000,
+                actual: 2_317
+            ) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+
+        XCTAssertEqual(smc.writes.filter { $0.key == "F0Tg" }.count, 3)
+        XCTAssertEqual(try smc.read("F0Md").numericValue, 0)
+        XCTAssertEqual(try smc.read("Ftst").numericValue, 0)
+    }
+
+    func testAutomaticModeWriteRetriesUntilReadbackChanges() throws {
+        let smc = FakeSMCClient(values: standardFanValues(mode: 1, forceTest: nil))
+        smc.ignoreWrites(key: "F0Md", bytes: [0], attempts: 2)
+        let timing = FanControlTiming(
+            forceTestWriteAttempts: 2,
+            forceTestWriteDelay: 0,
+            forceTestActivationDelay: 0,
+            manualModeWriteAttempts: 2,
+            manualModeWriteDelay: 0,
+            automaticModeWriteAttempts: 3,
+            automaticModeWriteDelay: 0
+        )
+
+        try FanController(smc: smc, timing: timing).setAutomatic(fanIndex: 0)
+
+        XCTAssertEqual(
+            smc.writes.filter { $0.key == "F0Md" && $0.bytes == [0] }.count,
+            3
+        )
+        XCTAssertEqual(try smc.read("F0Md").numericValue, 0)
+    }
+
+    func testAutomaticModeWriteExhaustionIsNotReportedAsSuccess() throws {
+        let smc = FakeSMCClient(values: standardFanValues(mode: 1, forceTest: nil))
+        smc.ignoreWrites(key: "F0Md", bytes: [0], attempts: 10)
+        let timing = FanControlTiming(
+            forceTestWriteAttempts: 2,
+            forceTestWriteDelay: 0,
+            forceTestActivationDelay: 0,
+            manualModeWriteAttempts: 2,
+            manualModeWriteDelay: 0,
+            automaticModeWriteAttempts: 2,
+            automaticModeWriteDelay: 0
+        )
+
+        XCTAssertThrowsError(
+            try FanController(smc: smc, timing: timing).setAutomatic(fanIndex: 0)
+        )
+        XCTAssertEqual(
+            smc.writes.filter { $0.key == "F0Md" && $0.bytes == [0] }.count,
+            2
+        )
+        XCTAssertEqual(try smc.read("F0Md").numericValue, 1)
+    }
+
+    func testForceTestClearRetriesUntilReadbackChanges() throws {
+        let smc = FakeSMCClient(values: standardFanValues(mode: 0, forceTest: 1))
+        smc.ignoreWrites(key: "Ftst", bytes: [0], attempts: 2)
+        let timing = FanControlTiming(
+            forceTestWriteAttempts: 2,
+            forceTestWriteDelay: 0,
+            forceTestActivationDelay: 0,
+            manualModeWriteAttempts: 2,
+            manualModeWriteDelay: 0,
+            forceTestClearAttempts: 3,
+            forceTestClearDelay: 0
+        )
+        let controller = FanController(smc: smc, timing: timing)
+
+        try controller.setAutomatic(fanIndex: 0)
+
+        XCTAssertEqual(
+            smc.writes.filter { $0.key == "Ftst" && $0.bytes == [0] }.count,
+            3
+        )
+        XCTAssertTrue(try controller.automaticControlStatus().isFullyAutomatic)
+    }
+
+    func testForceTestClearExhaustionIsNotReportedAsAutomatic() throws {
+        let smc = FakeSMCClient(values: standardFanValues(mode: 0, forceTest: 1))
+        smc.ignoreWrites(key: "Ftst", bytes: [0], attempts: 10)
+        let timing = FanControlTiming(
+            forceTestWriteAttempts: 2,
+            forceTestWriteDelay: 0,
+            forceTestActivationDelay: 0,
+            manualModeWriteAttempts: 2,
+            manualModeWriteDelay: 0,
+            forceTestClearAttempts: 2,
+            forceTestClearDelay: 0
+        )
+        let controller = FanController(smc: smc, timing: timing)
+
+        XCTAssertThrowsError(try controller.setAutomatic(fanIndex: 0))
+        XCTAssertEqual(
+            smc.writes.filter { $0.key == "Ftst" && $0.bytes == [0] }.count,
+            2
+        )
+        XCTAssertFalse(try controller.automaticControlStatus().isFullyAutomatic)
+    }
+
+    func testManualTargetIsNotReportedAsAppliedWhenModeDrops() throws {
+        let smc = FakeSMCClient(values: standardFanValues(mode: 0, forceTest: nil))
+        smc.forcedModeAfterNextTargetWrite = 0
+
+        XCTAssertThrowsError(
+            try FanController(smc: smc, timing: .immediate).setManual(fanIndex: 0, rpm: 5_000)
+        ) { error in
+            guard case FanControlError.modeVerificationFailed = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+
+        XCTAssertEqual(smc.writes.filter { $0.key == "F0Tg" }.count, 1)
+        XCTAssertEqual(try smc.read("F0Md").numericValue, 0)
     }
 
     func testManualRPMIsClampedAndVerified() throws {
@@ -269,6 +442,16 @@ private func ui8(_ key: String, _ value: UInt8) -> SMCValue {
     SMCValue(key: key, dataType: "ui8 ", dataSize: 1, bytes: [value])
 }
 
+private func fpe2(_ key: String, _ rpm: Double) -> SMCValue {
+    let raw = UInt16((rpm * 4).rounded())
+    return SMCValue(
+        key: key,
+        dataType: "fpe2",
+        dataSize: 2,
+        bytes: [UInt8(raw >> 8), UInt8(raw & 0xff)]
+    )
+}
+
 private func standardFanValues(mode: UInt8, forceTest: UInt8?) -> [String: SMCValue] {
     var values: [String: SMCValue] = [
         "FNum": ui8("FNum", 1),
@@ -285,6 +468,11 @@ private func standardFanValues(mode: UInt8, forceTest: UInt8?) -> [String: SMCVa
 }
 
 private final class FakeSMCClient: SMCClient, @unchecked Sendable {
+    private struct WriteSignature: Hashable {
+        let key: String
+        let bytes: [UInt8]
+    }
+
     enum Error: Swift.Error {
         case rejectedWrite(String)
     }
@@ -292,14 +480,31 @@ private final class FakeSMCClient: SMCClient, @unchecked Sendable {
     var rejectedWriteKeys = Set<String>()
     var manualModeRequiresForceTest = false
     var manualModePostForceTestRejectedAttempts = 0
+    var staleReadCountForNextWrite: [String: Int] = [:]
+    var forcedModeAfterNextTargetWrite: UInt8?
     private(set) var writes: [(key: String, bytes: [UInt8])] = []
     private var values: [String: SMCValue]
+    private var ignoredWriteAttempts: [WriteSignature: Int] = [:]
+    private var pendingWrites: [String: (value: SMCValue, remainingStaleReads: Int)] = [:]
 
     init(values: [String: SMCValue]) {
         self.values = values
     }
 
+    func ignoreWrites(key: String, bytes: [UInt8], attempts: Int) {
+        ignoredWriteAttempts[WriteSignature(key: key, bytes: bytes)] = attempts
+    }
+
     func read(_ key: String) throws -> SMCValue {
+        if var pending = pendingWrites[key] {
+            if pending.remainingStaleReads > 0 {
+                pending.remainingStaleReads -= 1
+                pendingWrites[key] = pending
+            } else {
+                values[key] = pending.value
+                pendingWrites.removeValue(forKey: key)
+            }
+        }
         guard let value = values[key] else {
             throw SMCError.firmwareRejected(key: key, 0x84)
         }
@@ -337,11 +542,30 @@ private final class FakeSMCClient: SMCClient, @unchecked Sendable {
             manualModePostForceTestRejectedAttempts -= 1
             return
         }
-        values[key] = SMCValue(
+        let signature = WriteSignature(key: key, bytes: bytes)
+        if let remaining = ignoredWriteAttempts[signature], remaining > 0 {
+            ignoredWriteAttempts[signature] = remaining - 1
+            return
+        }
+
+        let nextValue = SMCValue(
             key: key,
             dataType: existing.dataType,
             dataSize: existing.dataSize,
             bytes: bytes
         )
+        if var pending = pendingWrites[key] {
+            pending.value = nextValue
+            pendingWrites[key] = pending
+        } else if let staleReads = staleReadCountForNextWrite.removeValue(forKey: key), staleReads > 0 {
+            pendingWrites[key] = (nextValue, staleReads)
+        } else {
+            values[key] = nextValue
+        }
+
+        if key == "F0Tg", let forcedModeAfterNextTargetWrite {
+            values["F0Md"] = ui8("F0Md", forcedModeAfterNextTargetWrite)
+            self.forcedModeAfterNextTargetWrite = nil
+        }
     }
 }

@@ -108,6 +108,18 @@ enum L10n {
             "Switching fan mode… This may take a few seconds."
         )
     }
+    static var fanPresetFailedAndRestoredAutomatic: String {
+        text(
+            "팬 설정을 적용하지 못해 자동 모드로 되돌렸습니다.",
+            "The fan setting could not be applied, so Automatic mode was restored."
+        )
+    }
+    static var automaticRecoveryInProgress: String {
+        text(
+            "팬 설정을 적용하지 못했습니다. 자동 모드 복구를 다시 시도 중입니다.",
+            "The fan setting could not be applied. Retrying Automatic mode recovery."
+        )
+    }
     static var smcConnectionFailed: String { text("SMC 연결에 실패했습니다.", "SMC connection failed.") }
     static var noFansFound: String { text("팬을 찾을 수 없습니다.", "No fans found.") }
     static var missingPreset: String { text("사전 설정을 찾을 수 없습니다.", "Preset not found.") }
@@ -2637,6 +2649,7 @@ final class FanCtlMenuBarModel: NSObject {
     private var lastHelperProbeDate: Date?
     private var manualLeaseFailureCount = 0
     private var manualLeaseRenewalGeneration = 0
+    private var automaticRecoveryNoticePending = false
     private var notices: [NoticeSource: String] = [:]
     private var isLoadingUserPresets = true
     private var timer: Timer?
@@ -2839,6 +2852,7 @@ final class FanCtlMenuBarModel: NSObject {
             }
             helperState = .available
             requiresHelperApproval = false
+            automaticRecoveryNoticePending = false
             setNotice(nil, source: .control)
             setNotice(nil, source: .mode)
             setNotice(nil, source: .lease)
@@ -3063,6 +3077,7 @@ final class FanCtlMenuBarModel: NSObject {
     }
 
     private func applyPreset(_ preset: FanPreset) {
+        automaticRecoveryNoticePending = false
         safetyRecoveryPending = false
         safetyRecoveryTask?.cancel()
         safetyRecoveryTask = nil
@@ -3128,6 +3143,17 @@ final class FanCtlMenuBarModel: NSObject {
                     setNotice(nil, source: .control)
                     helperState = .unavailable
                     setNotice(error.localizedDescription, source: .helper)
+                } else if case FanCtlHelperClient.Error.rejected(let code, _) = error,
+                          code == "fan_control_failed",
+                          preset != .automatic {
+                    selectedPreset = .automatic
+                    setNotice(L10n.fanPresetFailedAndRestoredAutomatic, source: .control)
+                } else if case FanCtlHelperClient.Error.rejected(let code, _) = error,
+                          code == "automatic_recovery_failed" ||
+                              (code == "fan_control_failed" && preset == .automatic) {
+                    selectedPreset = nil
+                    automaticRecoveryNoticePending = true
+                    setNotice(L10n.automaticRecoveryInProgress, source: .control)
                 } else {
                     setNotice(error.localizedDescription, source: .control)
                 }
@@ -3487,6 +3513,10 @@ final class FanCtlMenuBarModel: NSObject {
                 return
             }
             selectedPreset = .automatic
+            if automaticRecoveryNoticePending {
+                automaticRecoveryNoticePending = false
+                setNotice(nil, source: .control)
+            }
             setNotice(nil, source: .mode)
             return
         }
