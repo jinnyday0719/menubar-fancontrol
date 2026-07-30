@@ -28,6 +28,9 @@ BIN="$ROOT/.build/$BUILD_CONFIGURATION/mfanctl-menubar"
 HELPER_BIN="$ROOT/.build/$BUILD_CONFIGURATION/mfanctl-helper"
 APP_VERSION="${APP_VERSION:-0.0.0}"
 BUILD_NUMBER="${BUILD_NUMBER:-0}"
+GENERATED_ASSETS="$ROOT/.build/packaging-assets"
+GENERATED_ICON="$GENERATED_ASSETS/AppIcon.icns"
+DSYM_OUTPUT_DIR="$ROOT/.build/dSYMs/$APP_VERSION-$BUILD_NUMBER"
 
 case "$BUILD_CONFIGURATION" in
     debug|release) ;;
@@ -74,7 +77,6 @@ fi
 
 for required_file in \
     "$ROOT/Resources/AppIcon.png" \
-    "$ROOT/Resources/AppIcon.icns" \
     "$ROOT/LICENSE"; do
     if [[ ! -f "$required_file" ]]; then
         echo "Required packaging input is missing: $required_file" >&2
@@ -83,6 +85,12 @@ for required_file in \
 done
 
 cd "$ROOT"
+"$ROOT/scripts/generate-app-icon.sh" "$GENERATED_ASSETS" >/dev/null
+if [[ ! -f "$GENERATED_ICON" ]]; then
+    echo "App icon generation did not produce: $GENERATED_ICON" >&2
+    exit 1
+fi
+
 swift build -c "$BUILD_CONFIGURATION" --product mfanctl-menubar
 swift build -c "$BUILD_CONFIGURATION" --product mfanctl-helper
 
@@ -93,6 +101,22 @@ for executable in "$BIN" "$HELPER_BIN"; do
     fi
 done
 
+if [[ "$PACKAGING_MODE" == "release" ]]; then
+    for command_name in dsymutil strip; do
+        if ! xcrun --find "$command_name" >/dev/null 2>&1; then
+            echo "Required release tool is unavailable: $command_name" >&2
+            exit 1
+        fi
+    done
+
+    mkdir -p "$DSYM_OUTPUT_DIR"
+    rm -rf \
+        "$DSYM_OUTPUT_DIR/$APP_EXECUTABLE.dSYM" \
+        "$DSYM_OUTPUT_DIR/$HELPER_EXECUTABLE.dSYM"
+    xcrun dsymutil "$BIN" -o "$DSYM_OUTPUT_DIR/$APP_EXECUTABLE.dSYM"
+    xcrun dsymutil "$HELPER_BIN" -o "$DSYM_OUTPUT_DIR/$HELPER_EXECUTABLE.dSYM"
+fi
+
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 mkdir -p "$APP/Contents/Library/LaunchDaemons"
@@ -102,9 +126,13 @@ cp "$BIN" "$APP/Contents/MacOS/$APP_EXECUTABLE"
 chmod +x "$APP/Contents/MacOS/$APP_EXECUTABLE"
 cp "$HELPER_BIN" "$APP/Contents/Library/LaunchServices/$HELPER_EXECUTABLE"
 chmod +x "$APP/Contents/Library/LaunchServices/$HELPER_EXECUTABLE"
-cp "$ROOT/Resources/AppIcon.png" "$APP/Contents/Resources/AppIcon.png"
-cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+cp "$GENERATED_ICON" "$APP/Contents/Resources/AppIcon.icns"
 cp "$ROOT/LICENSE" "$APP/Contents/Resources/LICENSE.txt"
+
+if [[ "$PACKAGING_MODE" == "release" ]]; then
+    xcrun strip -Sx "$APP/Contents/MacOS/$APP_EXECUTABLE"
+    xcrun strip -Sx "$APP/Contents/Library/LaunchServices/$HELPER_EXECUTABLE"
+fi
 
 cat > "$APP/Contents/Library/LaunchDaemons/$HELPER_ID.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

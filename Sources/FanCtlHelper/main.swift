@@ -8,9 +8,14 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
     private static let fastAutomaticRecoveryAttempts = 3
     private static let fastAutomaticRecoveryRetryInterval: TimeInterval = 5
     private static let slowAutomaticRecoveryRetryInterval: TimeInterval = 60
+    private static let startupAutomaticRecoveryDelay: TimeInterval = 1
 
     private let mutationLock = NSLock()
+    private let watchdogQueue = DispatchQueue(
+        label: "io.github.jinnyday0719.mfanctl.helper.manual-lease"
+    )
     private var leaseWatchdog: DispatchSourceTimer?
+    private var leaseWatchdogGeneration: UInt64 = 0
     private var manualLeaseDeadline: DispatchTime?
     private var automaticRecoveryPending = true
     private var automaticRecoveryAttempts = 0
@@ -20,19 +25,18 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
     override init() {
         super.init()
 
-        let watchdog = DispatchSource.makeTimerSource(
-            queue: DispatchQueue(label: "io.github.jinnyday0719.mfanctl.helper.manual-lease")
+        mutationLock.lock()
+        nextAutomaticRecoveryAttempt = deadline(
+            after: Self.startupAutomaticRecoveryDelay
         )
-        watchdog.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(250))
-        watchdog.setEventHandler { [weak self] in
-            self?.handleLeaseWatchdog()
-        }
-        leaseWatchdog = watchdog
-        watchdog.resume()
+        rescheduleLeaseWatchdogLocked()
+        mutationLock.unlock()
     }
 
     deinit {
-        leaseWatchdog?.cancel()
+        mutationLock.lock()
+        cancelLeaseWatchdogLocked()
+        mutationLock.unlock()
     }
 
     func ping(withReply reply: @escaping (NSString?, NSString?) -> Void) {
@@ -166,6 +170,7 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
                 automaticRecoveryPending = true
                 automaticRecoveryAttempts = 0
                 nextAutomaticRecoveryAttempt = now
+                rescheduleLeaseWatchdogLocked()
             }
             throw FanCtlHelperError.manualLeaseInactive
         }
@@ -174,6 +179,7 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
             after: FanCtlHelperConstants.manualControlLeaseDuration,
             from: now
         )
+        rescheduleLeaseWatchdogLocked()
     }
 
     private func armManualControlLease() {
@@ -182,12 +188,14 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
         )
         automaticRecoveryPending = false
         automaticRecoveryAttempts = 0
+        rescheduleLeaseWatchdogLocked()
     }
 
     private func clearManualControlLease() {
         manualLeaseDeadline = nil
         automaticRecoveryPending = false
         automaticRecoveryAttempts = 0
+        rescheduleLeaseWatchdogLocked()
     }
 
     private func scheduleAutomaticRecoveryAfterFailedAttempt() {
@@ -197,6 +205,7 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
         nextAutomaticRecoveryAttempt = deadline(
             after: Self.fastAutomaticRecoveryRetryInterval
         )
+        rescheduleLeaseWatchdogLocked()
     }
 
     private func deadline(
@@ -206,10 +215,56 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
         start + .milliseconds(Int(interval * 1_000))
     }
 
-    private func handleLeaseWatchdog() {
+    private func rescheduleLeaseWatchdogLocked() {
+        cancelLeaseWatchdogLocked()
+
+        guard let nextDeadline = nextLeaseWatchdogDeadlineLocked() else {
+            // No active lease and no recovery work: retain no timer at all so the
+            // privileged helper stays completely idle.
+            return
+        }
+
+        let generation = leaseWatchdogGeneration
+        let watchdog = DispatchSource.makeTimerSource(queue: watchdogQueue)
+        watchdog.schedule(deadline: nextDeadline, leeway: .milliseconds(250))
+        watchdog.setEventHandler { [weak self] in
+            self?.handleLeaseWatchdog(generation: generation)
+        }
+        leaseWatchdog = watchdog
+        watchdog.resume()
+    }
+
+    private func cancelLeaseWatchdogLocked() {
+        // Cancellation can race an event that is already queued. Advancing the
+        // generation makes that event a no-op even if it runs later.
+        leaseWatchdogGeneration &+= 1
+        let watchdog = leaseWatchdog
+        leaseWatchdog = nil
+        watchdog?.cancel()
+    }
+
+    private func nextLeaseWatchdogDeadlineLocked() -> DispatchTime? {
+        guard automaticRecoveryPending else {
+            return manualLeaseDeadline
+        }
+        guard let manualLeaseDeadline else {
+            return nextAutomaticRecoveryAttempt
+        }
+        return nextAutomaticRecoveryAttempt.uptimeNanoseconds < manualLeaseDeadline.uptimeNanoseconds
+            ? nextAutomaticRecoveryAttempt
+            : manualLeaseDeadline
+    }
+
+    private func handleLeaseWatchdog(generation: UInt64) {
         var logMessages: [String] = []
 
         mutationLock.lock()
+        guard generation == leaseWatchdogGeneration else {
+            mutationLock.unlock()
+            return
+        }
+        cancelLeaseWatchdogLocked()
+
         let now = DispatchTime.now()
         if let currentDeadline = manualLeaseDeadline,
            currentDeadline.uptimeNanoseconds <= now.uptimeNanoseconds {
@@ -248,9 +303,13 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
                     )
                 }
                 automaticRecoveryPending = true
-                nextAutomaticRecoveryAttempt = deadline(after: retryInterval, from: now)
+                // Base the backoff on completion rather than the pre-attempt
+                // timestamp. A slow firmware timeout must not cause the next
+                // recovery attempt to fire immediately.
+                nextAutomaticRecoveryAttempt = deadline(after: retryInterval)
             }
         }
+        rescheduleLeaseWatchdogLocked()
         mutationLock.unlock()
 
         for message in logMessages {
@@ -265,13 +324,11 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
         var failures: [String] = []
 
         // Automatic is the safety state, so continue attempting every fan even when
-        // one fan fails. A partial result is still reported as a failure below.
-        for fanIndex in 0..<fanCount {
-            do {
-                try controller.setAutomatic(fanIndex: fanIndex)
-            } catch {
-                failures.append("fan \(fanIndex): \(error.localizedDescription)")
-            }
+        // one fan fails. The batch API preserves per-fan failure details.
+        do {
+            try controller.setAutomatic()
+        } catch {
+            failures.append(error.localizedDescription)
         }
 
         let verificationFailures = automaticVerificationFailures(
@@ -381,12 +438,10 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
         fans: [ControllableFan]
     ) -> [String] {
         var failures: [String] = []
-        for fan in fans {
-            do {
-                try controller.setAutomatic(fanIndex: fan.index)
-            } catch {
-                failures.append("fan \(fan.index): \(error.localizedDescription)")
-            }
+        do {
+            try controller.setAutomatic()
+        } catch {
+            failures.append(error.localizedDescription)
         }
         let verificationFailures = automaticVerificationFailures(
             smc: smc,

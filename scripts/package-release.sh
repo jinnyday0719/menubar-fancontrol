@@ -160,12 +160,54 @@ EOF
     exit 1
 fi
 
+mkdir -p "$DIST"
+APP_ZIP="$DIST/.$APP_NAME-$APP_VERSION-notary.zip"
+DMG="$DIST/$APP_NAME-$APP_VERSION.dmg"
+PREVIOUS_DMG="$DMG.previous"
+STAGED_DMG="$DIST/.$APP_NAME-$APP_VERSION-staging.dmg"
+DMG_ROOT=""
+RELEASE_SUCCEEDED=false
+
+cleanup() {
+    if [[ -n "$DMG_ROOT" ]]; then
+        rm -rf "$DMG_ROOT"
+    fi
+    rm -f "$APP_ZIP"
+    rm -f "$STAGED_DMG"
+    if [[ "$RELEASE_SUCCEEDED" == "true" ]]; then
+        rm -f "$PREVIOUS_DMG"
+    elif [[ -f "$PREVIOUS_DMG" ]]; then
+        echo "Previous successful DMG retained separately after release failure: $PREVIOUS_DMG" >&2
+    fi
+}
+trap cleanup EXIT
+
+# Remove the old artifact from the final path before any build/signing work.
+# If anything below fails, the previous known-good DMG remains recoverable as
+# `.previous` and cannot be mistaken for the attempted release.
+if [[ -f "$DMG" ]]; then
+    if [[ -e "$PREVIOUS_DMG" ]]; then
+        echo "Cannot isolate the existing DMG because a previous backup already exists: $PREVIOUS_DMG" >&2
+        exit 1
+    fi
+    mv "$DMG" "$PREVIOUS_DMG"
+fi
+
 cd "$ROOT"
 APP_VERSION="$APP_VERSION" \
 BUILD_NUMBER="$BUILD_NUMBER" \
 BUILD_CONFIGURATION=release \
 PACKAGING_MODE=release \
     "$ROOT/scripts/package-menubar-app.sh" >/dev/null
+
+BUILT_DSYM_DIR="$ROOT/.build/dSYMs/$APP_VERSION-$BUILD_NUMBER"
+RELEASE_DSYM_DIR="$DIST/$APP_NAME-$APP_VERSION-$BUILD_NUMBER.dSYMs"
+if [[ ! -d "$BUILT_DSYM_DIR" ]]; then
+    echo "Release packaging did not produce dSYMs: $BUILT_DSYM_DIR" >&2
+    exit 1
+fi
+rm -rf "$RELEASE_DSYM_DIR"
+ditto "$BUILT_DSYM_DIR" "$RELEASE_DSYM_DIR"
 
 if [[ ! -x "$APP/Contents/MacOS/$APP_EXECUTABLE" || ! -x "$HELPER" ]]; then
     echo "Release bundle is missing an expected executable." >&2
@@ -230,18 +272,7 @@ if [[ "$APP_TEAM" != "$HELPER_TEAM" ]]; then
     exit 1
 fi
 
-mkdir -p "$DIST"
 DMG_ROOT="$(mktemp -d "$DIST/dmg-root.XXXXXX")"
-APP_ZIP="$DIST/.$APP_NAME-$APP_VERSION-notary.zip"
-DMG="$DIST/$APP_NAME-$APP_VERSION.dmg"
-STAGED_DMG="$DIST/.$APP_NAME-$APP_VERSION-staging.dmg"
-
-cleanup() {
-    rm -rf "$DMG_ROOT"
-    rm -f "$APP_ZIP"
-    rm -f "$STAGED_DMG"
-}
-trap cleanup EXIT
 
 submit_for_notarization() {
     local artifact="$1"
@@ -297,5 +328,6 @@ codesign --verify --strict --verbose=2 "$STAGED_DMG"
 spctl --assess --type open --context context:primary-signature --verbose "$STAGED_DMG"
 
 mv -f "$STAGED_DMG" "$DMG"
+RELEASE_SUCCEEDED=true
 
 echo "$DMG"

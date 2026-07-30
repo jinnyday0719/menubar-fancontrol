@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 
 public enum FanControlStrategy: Equatable, Sendable {
@@ -78,6 +79,7 @@ public enum FanControlError: Error, LocalizedError, Sendable {
     case modeVerificationFailed(fanIndex: Int, expected: String, actual: Int)
     case valueVerificationFailed(key: String, expected: Int, actual: Int)
     case targetVerificationFailed(fanIndex: Int, expected: Double, actual: Double)
+    case automaticBatchFailed(failures: [String])
     case rollbackFailed(originalError: String, rollbackError: String)
 
     public var errorDescription: String? {
@@ -98,6 +100,8 @@ public enum FanControlError: Error, LocalizedError, Sendable {
             "SMC key \(key) verification failed: expected \(expected), received \(actual)."
         case .targetVerificationFailed(let fanIndex, let expected, let actual):
             "Fan \(fanIndex) target verification failed: expected \(expected) RPM, received \(actual) RPM."
+        case .automaticBatchFailed(let failures):
+            "Restoring automatic fan control failed: \(failures.joined(separator: "; "))."
         case .rollbackFailed(let originalError, let rollbackError):
             "Fan control failed (\(originalError)), and restoring the previous safe state also failed (\(rollbackError))."
         }
@@ -116,6 +120,8 @@ struct FanControlTiming: Sendable {
     let automaticModeWriteDelay: TimeInterval
     let forceTestClearAttempts: Int
     let forceTestClearDelay: TimeInterval
+    let maximumRetryDuration: TimeInterval
+    let maximumRetryDelay: TimeInterval
 
     init(
         forceTestWriteAttempts: Int,
@@ -128,7 +134,9 @@ struct FanControlTiming: Sendable {
         automaticModeWriteAttempts: Int = 2,
         automaticModeWriteDelay: TimeInterval = 0,
         forceTestClearAttempts: Int = 2,
-        forceTestClearDelay: TimeInterval = 0
+        forceTestClearDelay: TimeInterval = 0,
+        maximumRetryDuration: TimeInterval = 5,
+        maximumRetryDelay: TimeInterval = 0.25
     ) {
         let attempts = [
             forceTestWriteAttempts,
@@ -145,7 +153,9 @@ struct FanControlTiming: Sendable {
             manualModeWriteDelay,
             targetWriteDelay,
             automaticModeWriteDelay,
-            forceTestClearDelay
+            forceTestClearDelay,
+            maximumRetryDuration,
+            maximumRetryDelay
         ]
         precondition(
             delays.allSatisfy { $0.isFinite && $0 >= 0 },
@@ -163,20 +173,26 @@ struct FanControlTiming: Sendable {
         self.automaticModeWriteDelay = automaticModeWriteDelay
         self.forceTestClearAttempts = forceTestClearAttempts
         self.forceTestClearDelay = forceTestClearDelay
+        self.maximumRetryDuration = maximumRetryDuration
+        self.maximumRetryDelay = maximumRetryDelay
     }
 
     static let production = FanControlTiming(
-        forceTestWriteAttempts: 100,
+        // Keep the previous firmware-compatibility windows while using
+        // exponentially fewer wakeups than fixed 50/100 ms polling.
+        forceTestWriteAttempts: 14,
         forceTestWriteDelay: 0.05,
-        forceTestActivationDelay: 0.5,
-        manualModeWriteAttempts: 100,
+        forceTestActivationDelay: 0,
+        manualModeWriteAttempts: 24,
         manualModeWriteDelay: 0.1,
-        targetWriteAttempts: 20,
+        targetWriteAttempts: 8,
         targetWriteDelay: 0.05,
-        automaticModeWriteAttempts: 20,
+        automaticModeWriteAttempts: 12,
         automaticModeWriteDelay: 0.05,
-        forceTestClearAttempts: 20,
-        forceTestClearDelay: 0.05
+        forceTestClearAttempts: 8,
+        forceTestClearDelay: 0.05,
+        maximumRetryDuration: 12,
+        maximumRetryDelay: 0.5
     )
 
     static let immediate = FanControlTiming(
@@ -190,7 +206,9 @@ struct FanControlTiming: Sendable {
         automaticModeWriteAttempts: 2,
         automaticModeWriteDelay: 0,
         forceTestClearAttempts: 2,
-        forceTestClearDelay: 0
+        forceTestClearDelay: 0,
+        maximumRetryDuration: 1,
+        maximumRetryDelay: 0
     )
 }
 
@@ -253,6 +271,7 @@ public final class FanController: Sendable {
     public func setManual(fanIndex: Int, rpm requestedRPM: Double) throws -> FanControlResult {
         controlLock.lock()
         defer { controlLock.unlock() }
+        let operationDeadline = retryDeadline()
 
         guard requestedRPM.isFinite, requestedRPM >= 0 else {
             throw FanControlError.invalidRPM(requestedRPM)
@@ -286,11 +305,15 @@ public final class FanController: Sendable {
         )
 
         do {
-            let strategy = try enableManualMode(preflight: preflight)
+            let strategy = try enableManualMode(
+                preflight: preflight,
+                deadline: operationDeadline
+            )
             let verifiedRPM = try writeRPMWithRetry(
                 preflight: preflight,
                 rpm: appliedRPM,
-                targetValue: targetValue
+                targetValue: targetValue,
+                deadline: operationDeadline
             )
 
             return FanControlResult(
@@ -301,7 +324,14 @@ public final class FanController: Sendable {
             )
         } catch {
             do {
-                try rollback(preflight)
+                // Safety recovery gets a fresh bounded window even if the
+                // primary operation exhausted its deadline.
+                try rollback(
+                    preflight,
+                    deadline: retryDeadline(
+                        maximumDuration: min(timing.maximumRetryDuration, 5)
+                    )
+                )
             } catch let rollbackError {
                 throw FanControlError.rollbackFailed(
                     originalError: error.localizedDescription,
@@ -315,10 +345,68 @@ public final class FanController: Sendable {
     public func setAutomatic(fanIndex: Int) throws {
         controlLock.lock()
         defer { controlLock.unlock() }
+        let operationDeadline = retryDeadline()
 
         try validateFanIndex(fanIndex)
         let resolved = try resolveFanMode(fanIndex: fanIndex)
-        try restoreSystemControl(fanIndex: fanIndex, modeKey: resolved.key, modeValue: resolved.value)
+        try restoreSystemControl(
+            fanIndex: fanIndex,
+            modeKey: resolved.key,
+            modeValue: resolved.value,
+            deadline: operationDeadline
+        )
+    }
+
+    /// Restores every fan in one transaction-like pass. This avoids repeating
+    /// fan-count, all-fan safety, and Ftst verification for each individual fan.
+    public func setAutomatic() throws {
+        controlLock.lock()
+        defer { controlLock.unlock() }
+
+        let operationDeadline = retryDeadline()
+        let count = try fanCount()
+        var failures: [String] = []
+
+        for fanIndex in 0..<count {
+            do {
+                let resolved = try resolveFanMode(fanIndex: fanIndex)
+                if !resolved.mode.isSystemControlled {
+                    _ = try writeSystemModeWithRetry(
+                        fanIndex: fanIndex,
+                        modeKey: resolved.key,
+                        reference: resolved.value,
+                        deadline: operationDeadline
+                    )
+                }
+            } catch {
+                failures.append("fan \(fanIndex): \(error.localizedDescription)")
+            }
+        }
+
+        if !failures.isEmpty {
+            // A reported write/read failure can still leave every fan in a
+            // system-controlled mode. Re-check the complete set and clear Ftst
+            // only when that is demonstrably safe.
+            do {
+                if try clearForceTestModeWhenSafe(deadline: operationDeadline) {
+                    return
+                }
+            } catch {
+                failures.append("final recovery: \(error.localizedDescription)")
+            }
+            throw FanControlError.automaticBatchFailed(failures: failures)
+        }
+
+        do {
+            try clearForceTestModeAfterBatch(
+                fanCount: count,
+                deadline: operationDeadline
+            )
+        } catch {
+            throw FanControlError.automaticBatchFailed(
+                failures: ["final verification: \(error.localizedDescription)"]
+            )
+        }
     }
 
     private func validateFanIndex(_ fanIndex: Int) throws {
@@ -328,7 +416,10 @@ public final class FanController: Sendable {
         }
     }
 
-    private func enableManualMode(preflight: ManualPreflight) throws -> FanControlStrategy {
+    private func enableManualMode(
+        preflight: ManualPreflight,
+        deadline: UInt64
+    ) throws -> FanControlStrategy {
         if preflight.initialMode == .manual {
             return .directModeWrite
         }
@@ -346,6 +437,9 @@ public final class FanController: Sendable {
             }
             return .directModeWrite
         } catch {
+            guard isManualUnlockCandidate(error) else {
+                throw error
+            }
             directWriteError = error
         }
 
@@ -363,10 +457,14 @@ public final class FanController: Sendable {
                 key: "Ftst",
                 reference: forceTestValue,
                 maxAttempts: timing.forceTestWriteAttempts,
-                delay: timing.forceTestWriteDelay
+                delay: timing.forceTestWriteDelay,
+                deadline: deadline
             )
             if timing.forceTestActivationDelay > 0 {
-                Thread.sleep(forTimeInterval: timing.forceTestActivationDelay)
+                waitForActivation(
+                    timing.forceTestActivationDelay,
+                    deadline: deadline
+                )
             }
         }
 
@@ -375,17 +473,19 @@ public final class FanController: Sendable {
             modeKey: preflight.modeKey,
             reference: preflight.modeValue,
             maxAttempts: timing.manualModeWriteAttempts,
-            delay: timing.manualModeWriteDelay
+            delay: timing.manualModeWriteDelay,
+            deadline: deadline
         )
         return .forceTestUnlock
     }
 
-    private func rollback(_ preflight: ManualPreflight) throws {
+    private func rollback(_ preflight: ManualPreflight, deadline: UInt64) throws {
         if preflight.initialMode == .manual {
             _ = try writeRPMWithRetry(
                 preflight: preflight,
                 rpm: preflight.initialTargetRPM,
-                targetValue: preflight.targetValue
+                targetValue: preflight.targetValue,
+                deadline: deadline
             )
             let mode = try readMode(key: preflight.modeKey)
             guard mode == .manual else {
@@ -401,21 +501,28 @@ public final class FanController: Sendable {
         try restoreSystemControl(
             fanIndex: preflight.fanIndex,
             modeKey: preflight.modeKey,
-            modeValue: preflight.modeValue
+            modeValue: preflight.modeValue,
+            deadline: deadline
         )
     }
 
-    private func restoreSystemControl(fanIndex: Int, modeKey: String, modeValue: SMCValue) throws {
+    private func restoreSystemControl(
+        fanIndex: Int,
+        modeKey: String,
+        modeValue: SMCValue,
+        deadline: UInt64
+    ) throws {
         var observed = try readMode(key: modeKey)
         if !observed.isSystemControlled {
             observed = try writeSystemModeWithRetry(
                 fanIndex: fanIndex,
                 modeKey: modeKey,
-                reference: modeValue
+                reference: modeValue,
+                deadline: deadline
             )
         }
 
-        try clearForceTestModeWhenSafe()
+        _ = try clearForceTestModeWhenSafe(deadline: deadline)
 
         observed = try readMode(key: modeKey)
         guard observed.isSystemControlled else {
@@ -427,20 +534,20 @@ public final class FanController: Sendable {
         }
     }
 
-    private func clearForceTestModeWhenSafe() throws {
+    private func clearForceTestModeWhenSafe(deadline: UInt64) throws -> Bool {
         let count = try fanCount()
         for index in 0..<count {
             guard try resolveFanMode(fanIndex: index).mode.isSystemControlled else {
-                return
+                return false
             }
         }
 
         guard let forceTestValue = try readOptionalValue("Ftst") else {
-            return
+            return true
         }
         let current = try integerValue(forceTestValue, key: "Ftst")
         guard current != 0 else {
-            return
+            return true
         }
 
         try writeIntegerWithRetry(
@@ -448,10 +555,37 @@ public final class FanController: Sendable {
             key: "Ftst",
             reference: forceTestValue,
             maxAttempts: timing.forceTestClearAttempts,
-            delay: timing.forceTestClearDelay
+            delay: timing.forceTestClearDelay,
+            deadline: deadline
         )
 
-        try verifySystemControlAfterClearingForceTest(fanCount: count)
+        try verifySystemControlAfterClearingForceTest(
+            fanCount: count,
+            deadline: deadline
+        )
+        return true
+    }
+
+    private func clearForceTestModeAfterBatch(
+        fanCount: Int,
+        deadline: UInt64
+    ) throws {
+        if let forceTestValue = try readOptionalValue("Ftst"),
+           try integerValue(forceTestValue, key: "Ftst") != 0 {
+            try writeIntegerWithRetry(
+                0,
+                key: "Ftst",
+                reference: forceTestValue,
+                maxAttempts: timing.forceTestClearAttempts,
+                delay: timing.forceTestClearDelay,
+                deadline: deadline
+            )
+        }
+
+        try verifySystemControlAfterClearingForceTest(
+            fanCount: fanCount,
+            deadline: deadline
+        )
     }
 
     private func writeRPM(fanIndex: Int, rpm: Double, targetValue: SMCValue) throws {
@@ -462,7 +596,8 @@ public final class FanController: Sendable {
     private func writeRPMWithRetry(
         preflight: ManualPreflight,
         rpm: Double,
-        targetValue: SMCValue
+        targetValue: SMCValue,
+        deadline: UInt64
     ) throws -> Double {
         let targetKey = "F\(preflight.fanIndex)Tg"
         var lastError: Error?
@@ -501,17 +636,20 @@ public final class FanController: Sendable {
                     )
                 }
                 return verifiedRPM
-            } catch let error as FanControlError {
-                if case .modeVerificationFailed = error {
+            } catch {
+                guard isTargetVerificationFailure(error) else {
                     throw error
                 }
                 lastError = error
-            } catch {
-                lastError = error
             }
 
-            if attempt < timing.targetWriteAttempts - 1 {
-                Thread.sleep(forTimeInterval: timing.targetWriteDelay)
+            guard waitBeforeRetry(
+                after: attempt,
+                maxAttempts: timing.targetWriteAttempts,
+                initialDelay: timing.targetWriteDelay,
+                deadline: deadline
+            ) else {
+                break
             }
         }
 
@@ -640,7 +778,8 @@ public final class FanController: Sendable {
         key: String,
         reference: SMCValue,
         maxAttempts: Int,
-        delay: TimeInterval
+        delay: TimeInterval,
+        deadline: UInt64
     ) throws {
         var lastError: Error?
         for attempt in 0..<maxAttempts {
@@ -656,10 +795,18 @@ public final class FanController: Sendable {
                 }
                 return
             } catch {
-                lastError = error
-                if attempt < maxAttempts - 1 {
-                    Thread.sleep(forTimeInterval: delay)
+                guard isValueVerificationFailure(error) else {
+                    throw error
                 }
+                lastError = error
+            }
+            guard waitBeforeRetry(
+                after: attempt,
+                maxAttempts: maxAttempts,
+                initialDelay: delay,
+                deadline: deadline
+            ) else {
+                break
             }
         }
         throw lastError ?? SMCError.invalidNumericValue(key: key)
@@ -670,7 +817,8 @@ public final class FanController: Sendable {
         modeKey: String,
         reference: SMCValue,
         maxAttempts: Int,
-        delay: TimeInterval
+        delay: TimeInterval,
+        deadline: UInt64
     ) throws {
         var lastError: Error?
         for attempt in 0..<maxAttempts {
@@ -686,10 +834,18 @@ public final class FanController: Sendable {
                 }
                 return
             } catch {
-                lastError = error
-                if attempt < maxAttempts - 1 {
-                    Thread.sleep(forTimeInterval: delay)
+                guard isModeVerificationFailure(error) else {
+                    throw error
                 }
+                lastError = error
+            }
+            guard waitBeforeRetry(
+                after: attempt,
+                maxAttempts: maxAttempts,
+                initialDelay: delay,
+                deadline: deadline
+            ) else {
+                break
             }
         }
         throw lastError ?? FanControlError.modeVerificationFailed(
@@ -702,7 +858,8 @@ public final class FanController: Sendable {
     private func writeSystemModeWithRetry(
         fanIndex: Int,
         modeKey: String,
-        reference: SMCValue
+        reference: SMCValue,
+        deadline: UInt64
     ) throws -> ObservedFanMode {
         var lastError: Error?
         for attempt in 0..<timing.automaticModeWriteAttempts {
@@ -718,10 +875,18 @@ public final class FanController: Sendable {
                 }
                 return observed
             } catch {
-                lastError = error
-                if attempt < timing.automaticModeWriteAttempts - 1 {
-                    Thread.sleep(forTimeInterval: timing.automaticModeWriteDelay)
+                guard isModeVerificationFailure(error) else {
+                    throw error
                 }
+                lastError = error
+            }
+            guard waitBeforeRetry(
+                after: attempt,
+                maxAttempts: timing.automaticModeWriteAttempts,
+                initialDelay: timing.automaticModeWriteDelay,
+                deadline: deadline
+            ) else {
+                break
             }
         }
         throw lastError ?? FanControlError.modeVerificationFailed(
@@ -731,13 +896,18 @@ public final class FanController: Sendable {
         )
     }
 
-    private func verifySystemControlAfterClearingForceTest(fanCount: Int) throws {
+    private func verifySystemControlAfterClearingForceTest(
+        fanCount: Int,
+        deadline: UInt64
+    ) throws {
         var lastError: Error?
 
         for attempt in 0..<timing.automaticModeWriteAttempts {
-            do {
-                var firstMismatch: FanControlError?
-                for fanIndex in 0..<fanCount {
+            var verificationFailures: [FanControlError] = []
+            var nonRetryableFailures: [String] = []
+
+            for fanIndex in 0..<fanCount {
+                do {
                     let resolved = try resolveFanMode(fanIndex: fanIndex)
                     guard !resolved.mode.isSystemControlled else {
                         continue
@@ -745,24 +915,48 @@ public final class FanController: Sendable {
 
                     try writeInteger(0, key: resolved.key, reference: resolved.value)
                     let verified = try readMode(key: resolved.key)
-                    if !verified.isSystemControlled, firstMismatch == nil {
-                        firstMismatch = FanControlError.modeVerificationFailed(
+                    if !verified.isSystemControlled {
+                        verificationFailures.append(FanControlError.modeVerificationFailed(
                             fanIndex: fanIndex,
                             expected: "automatic or system-managed after clearing Ftst",
                             actual: verified.rawValue
+                        ))
+                    }
+                } catch {
+                    if isModeVerificationFailure(error),
+                       let verificationFailure = error as? FanControlError {
+                        verificationFailures.append(verificationFailure)
+                    } else {
+                        nonRetryableFailures.append(
+                            "fan \(fanIndex): \(error.localizedDescription)"
                         )
                     }
                 }
+            }
 
-                if let firstMismatch {
-                    throw firstMismatch
-                }
+            if !nonRetryableFailures.isEmpty {
+                nonRetryableFailures.append(
+                    contentsOf: verificationFailures.map(\.localizedDescription)
+                )
+                throw FanControlError.automaticBatchFailed(
+                    failures: nonRetryableFailures
+                )
+            }
+
+            guard !verificationFailures.isEmpty else {
                 return
-            } catch {
-                lastError = error
-                if attempt < timing.automaticModeWriteAttempts - 1 {
-                    Thread.sleep(forTimeInterval: timing.automaticModeWriteDelay)
-                }
+            }
+            lastError = FanControlError.automaticBatchFailed(
+                failures: verificationFailures.map(\.localizedDescription)
+            )
+
+            guard waitBeforeRetry(
+                after: attempt,
+                maxAttempts: timing.automaticModeWriteAttempts,
+                initialDelay: timing.automaticModeWriteDelay,
+                deadline: deadline
+            ) else {
+                break
             }
         }
 
@@ -775,5 +969,81 @@ public final class FanController: Sendable {
 
     private func speedsMatch(_ lhs: Double, _ rhs: Double) -> Bool {
         abs(lhs - rhs) <= max(1, abs(rhs) * 0.001)
+    }
+
+    private func isModeVerificationFailure(_ error: Error) -> Bool {
+        guard case FanControlError.modeVerificationFailed = error else {
+            return false
+        }
+        return true
+    }
+
+    private func isManualUnlockCandidate(_ error: Error) -> Bool {
+        if isModeVerificationFailure(error) {
+            return true
+        }
+        if case SMCError.firmwareRejected = error {
+            // Some firmware reports a rejected direct mode write instead of
+            // silently retaining Automatic. Ftst is the supported fallback
+            // strategy for that state; the rejected write itself is not retried.
+            return true
+        }
+        return false
+    }
+
+    private func isValueVerificationFailure(_ error: Error) -> Bool {
+        guard case FanControlError.valueVerificationFailed = error else {
+            return false
+        }
+        return true
+    }
+
+    private func isTargetVerificationFailure(_ error: Error) -> Bool {
+        guard case FanControlError.targetVerificationFailed = error else {
+            return false
+        }
+        return true
+    }
+
+    private func retryDeadline(maximumDuration: TimeInterval? = nil) -> UInt64 {
+        let duration = maximumDuration ?? timing.maximumRetryDuration
+        let nanoseconds = UInt64(duration * 1_000_000_000)
+        return DispatchTime.now().uptimeNanoseconds &+ nanoseconds
+    }
+
+    private func waitForActivation(_ delay: TimeInterval, deadline: UInt64) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now < deadline else {
+            return
+        }
+        let remaining = TimeInterval(deadline - now) / 1_000_000_000
+        Thread.sleep(forTimeInterval: min(delay, remaining))
+    }
+
+    private func waitBeforeRetry(
+        after attempt: Int,
+        maxAttempts: Int,
+        initialDelay: TimeInterval,
+        deadline: UInt64
+    ) -> Bool {
+        guard attempt < maxAttempts - 1 else {
+            return false
+        }
+
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now < deadline else {
+            return false
+        }
+
+        guard initialDelay > 0 else {
+            return true
+        }
+
+        let exponent = min(attempt, 8)
+        let backoff = initialDelay * pow(2, Double(exponent))
+        let delay = min(backoff, timing.maximumRetryDelay)
+        let remaining = TimeInterval(deadline - now) / 1_000_000_000
+        Thread.sleep(forTimeInterval: min(delay, remaining))
+        return DispatchTime.now().uptimeNanoseconds < deadline
     }
 }

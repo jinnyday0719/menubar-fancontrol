@@ -3,13 +3,16 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCE="$ROOT/Resources/AppIcon.png"
-ICONSET="$ROOT/Resources/AppIcon.iconset"
-ICNS="$ROOT/Resources/AppIcon.icns"
+OUTPUT_DIR="${1:-$ROOT/Resources}"
+ICONSET="$OUTPUT_DIR/AppIcon.iconset"
+ICNS="$OUTPUT_DIR/AppIcon.icns"
 
 if [[ ! -f "$SOURCE" ]]; then
   echo "PNG icon source not found: $SOURCE" >&2
   exit 1
 fi
+
+mkdir -p "$OUTPUT_DIR"
 
 render_png() {
   local size="$1"

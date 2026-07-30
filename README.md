@@ -77,9 +77,9 @@ Automatic mode or restart your Mac.
 Run `scripts/package-menubar-app.sh` to build an unsigned development app at
 `.build/mFanCtl.app`. This artifact can test the UI and read-only sensors, but
 its privileged fan-control helper intentionally rejects an unsigned client.
-It must not be distributed as a release. If `Resources/AppIcon.png` changes, run
-`scripts/generate-app-icon.sh` explicitly before packaging so the checked-in
-`AppIcon.icns` matches it.
+It must not be distributed as a release. Packaging generates `AppIcon.icns`
+from the tracked `Resources/AppIcon.png`, so a clean clone does not require a
+pre-generated icon file.
 
 ## Release packaging
 
@@ -102,6 +102,9 @@ the bundle versions and helper plist identities are correct, both executables
 have matching Developer ID teams and hardened-runtime signatures, and both the
 app and final DMG pass notarization, stapling, signature validation, and
 Gatekeeper assessment. The DMG and app resources both include the MIT license.
+Unstripped debug symbols are emitted separately under
+`dist/mFanCtl-VERSION-BUILD.dSYMs`; the signed app contains stripped
+executables.
 
 ## License
 

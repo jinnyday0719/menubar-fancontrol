@@ -43,6 +43,36 @@ public enum SMCError: Error, LocalizedError, Sendable {
     }
 }
 
+public enum SMCConnectionRecoveryDisposition: Equatable, Sendable {
+    case retainConnection
+    case reopenConnection
+}
+
+public protocol SMCConnectionRecoveryClassifying: Error {
+    var smcConnectionRecoveryDisposition: SMCConnectionRecoveryDisposition { get }
+}
+
+extension SMCError: SMCConnectionRecoveryClassifying {
+    public var smcConnectionRecoveryDisposition: SMCConnectionRecoveryDisposition {
+        switch self {
+        case .serviceNotFound, .openFailed, .readFailed, .writeFailed:
+            .reopenConnection
+        case .firmwareRejected, .invalidKey, .invalidDataSize, .invalidDataType,
+             .invalidNumericValue:
+            // These errors describe a key, payload, or firmware capability. Reopening
+            // the same AppleSMC service cannot make that data shape valid.
+            .retainConnection
+        }
+    }
+}
+
+public func smcConnectionRecoveryDisposition(
+    for error: any Error
+) -> SMCConnectionRecoveryDisposition {
+    (error as? any SMCConnectionRecoveryClassifying)?
+        .smcConnectionRecoveryDisposition ?? .reopenConnection
+}
+
 private enum SMCCommand: UInt8 {
     case readBytes = 5
     case writeBytes = 6
@@ -105,6 +135,65 @@ private struct SMCKeyData {
     )
 }
 
+struct SMCKeyMetadata: Equatable, Sendable {
+    let dataSize: IOByteCount32
+    let dataTypeCode: UInt32
+    let dataType: String
+}
+
+final class SMCKeyMetadataCache: @unchecked Sendable {
+    private enum Entry {
+        case metadata(SMCKeyMetadata)
+        case permanentFailure(SMCError)
+    }
+
+    private let lock = NSLock()
+    private var entries: [UInt32: Entry] = [:]
+
+    func metadata(
+        for key: UInt32,
+        load: () throws -> SMCKeyMetadata
+    ) throws -> SMCKeyMetadata {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let cached = entries[key] {
+            switch cached {
+            case .metadata(let metadata):
+                return metadata
+            case .permanentFailure(let error):
+                throw error
+            }
+        }
+        do {
+            let loaded = try load()
+            entries[key] = .metadata(loaded)
+            return loaded
+        } catch let error as SMCError {
+            switch error {
+            case .firmwareRejected(_, let code) where code == 0x84:
+                // Key availability is stable for the lifetime of an AppleSMC
+                // connection. Remember unsupported keys so optional sensors do
+                // not issue a kernel call every sample.
+                entries[key] = .permanentFailure(error)
+            case .invalidDataSize, .invalidDataType:
+                // Key availability and metadata shape are stable for the lifetime
+                // of an AppleSMC connection.
+                entries[key] = .permanentFailure(error)
+            default:
+                break
+            }
+            throw error
+        } catch {
+            throw error
+        }
+    }
+
+    var count: Int {
+        lock.withLock { entries.count }
+    }
+}
+
 public final class SMCConnection: SMCClient, @unchecked Sendable {
     public let serviceName: String
     public static let parameterStructSize = MemoryLayout<SMCKeyData>.stride
@@ -115,6 +204,7 @@ public final class SMCConnection: SMCClient, @unchecked Sendable {
     static let parameterPayloadOffset = MemoryLayout<SMCKeyData>.offset(of: \.bytes)
     private let connection: io_connect_t
     private let callLock = NSRecursiveLock()
+    private let metadataCache = SMCKeyMetadataCache()
 
     public init() throws {
         var lastOpenResult: kern_return_t?
@@ -164,38 +254,15 @@ public final class SMCConnection: SMCClient, @unchecked Sendable {
         callLock.lock()
         defer { callLock.unlock() }
 
-        guard key.utf8.count == 4, key.utf8.allSatisfy({ $0 < 0x80 }) else {
-            throw SMCError.invalidKey(key)
-        }
-
+        let keyCode = try validatedKeyCode(key)
+        let metadata = try metadata(for: key, keyCode: keyCode)
         var input = SMCKeyData()
         var output = SMCKeyData()
-        input.key = FourCharCode(smcKey: key)
-        input.data8 = SMCCommand.readKeyInfo.rawValue
-
-        var result = call(input: &input, output: &output)
-        guard result == kIOReturnSuccess else {
-            throw SMCError.readFailed(key: key, result)
-        }
-        guard output.result == 0 else {
-            throw SMCError.firmwareRejected(key: key, output.result)
-        }
-
-        let keyInfo = output.keyInfo
-        guard (1...32).contains(Int(keyInfo.dataSize)) else {
-            throw SMCError.invalidDataSize(
-                key: key,
-                expected: "1...32 bytes",
-                actual: Int(keyInfo.dataSize)
-            )
-        }
-        guard let dataType = keyInfo.dataType.smcString else {
-            throw SMCError.invalidDataType(key: key, keyInfo.dataType)
-        }
-        input.keyInfo.dataSize = keyInfo.dataSize
+        input.key = keyCode
+        input.keyInfo.dataSize = metadata.dataSize
         input.data8 = SMCCommand.readBytes.rawValue
 
-        result = call(input: &input, output: &output)
+        let result = call(input: &input, output: &output)
         guard result == kIOReturnSuccess else {
             throw SMCError.readFailed(key: key, result)
         }
@@ -205,10 +272,10 @@ public final class SMCConnection: SMCClient, @unchecked Sendable {
 
         return SMCValue(
             key: key,
-            dataType: dataType,
-            dataSize: keyInfo.dataSize,
+            dataType: metadata.dataType,
+            dataSize: metadata.dataSize,
             resultCode: output.result,
-            bytes: bytesArray(output.bytes).prefix(Int(keyInfo.dataSize)).map { $0 }
+            bytes: bytesArray(output.bytes).prefix(Int(metadata.dataSize)).map { $0 }
         )
     }
 
@@ -220,10 +287,9 @@ public final class SMCConnection: SMCClient, @unchecked Sendable {
         callLock.lock()
         defer { callLock.unlock() }
 
-        guard key.utf8.count == 4, key.utf8.allSatisfy({ $0 < 0x80 }) else {
-            throw SMCError.invalidKey(key)
-        }
-
+        let keyCode = try validatedKeyCode(key)
+        // Preserve the pre-write read check: writes are rare and safety-sensitive.
+        // The read still benefits from cached key metadata after its first access.
         let existing = try read(key)
         let expectedSize = Int(existing.dataSize)
         guard (1...32).contains(expectedSize) else {
@@ -243,7 +309,7 @@ public final class SMCConnection: SMCClient, @unchecked Sendable {
 
         var input = SMCKeyData()
         var output = SMCKeyData()
-        input.key = FourCharCode(smcKey: key)
+        input.key = keyCode
         input.keyInfo.dataSize = existing.dataSize
         input.data8 = SMCCommand.writeBytes.rawValue
         input.bytes = bytesTuple(bytes)
@@ -254,6 +320,47 @@ public final class SMCConnection: SMCClient, @unchecked Sendable {
         }
         guard output.result == 0 else {
             throw SMCError.firmwareRejected(key: key, output.result)
+        }
+    }
+
+    private func validatedKeyCode(_ key: String) throws -> UInt32 {
+        guard key.utf8.count == 4, key.utf8.allSatisfy({ $0 < 0x80 }) else {
+            throw SMCError.invalidKey(key)
+        }
+        return FourCharCode(smcKey: key)
+    }
+
+    private func metadata(for key: String, keyCode: UInt32) throws -> SMCKeyMetadata {
+        try metadataCache.metadata(for: keyCode) {
+            var input = SMCKeyData()
+            var output = SMCKeyData()
+            input.key = keyCode
+            input.data8 = SMCCommand.readKeyInfo.rawValue
+
+            let result = call(input: &input, output: &output)
+            guard result == kIOReturnSuccess else {
+                throw SMCError.readFailed(key: key, result)
+            }
+            guard output.result == 0 else {
+                throw SMCError.firmwareRejected(key: key, output.result)
+            }
+
+            let keyInfo = output.keyInfo
+            guard (1...32).contains(Int(keyInfo.dataSize)) else {
+                throw SMCError.invalidDataSize(
+                    key: key,
+                    expected: "1...32 bytes",
+                    actual: Int(keyInfo.dataSize)
+                )
+            }
+            guard let dataType = keyInfo.dataType.smcString else {
+                throw SMCError.invalidDataType(key: key, keyInfo.dataType)
+            }
+            return SMCKeyMetadata(
+                dataSize: keyInfo.dataSize,
+                dataTypeCode: keyInfo.dataType,
+                dataType: dataType
+            )
         }
     }
 
