@@ -17,11 +17,18 @@ read_swift_constant() {
 
 APP_NAME="$(read_swift_constant appName)"
 APP_EXECUTABLE="$(read_swift_constant appExecutableName)"
+RELEASE_ARTIFACT_NAME="$(read_swift_constant releaseArtifactName)"
 BUNDLE_ID="$(read_swift_constant appBundleIdentifier)"
-HELPER_ID="$(read_swift_constant machServiceName)"
+HELPER_ID="$(read_swift_constant helperBundleIdentifier)"
+EXPECTED_TEAM_ID="$(read_swift_constant developerTeamIdentifier)"
 HELPER_EXECUTABLE="$(read_swift_constant helperExecutableName)"
+LEGACY_APP_BUNDLE_ID="$(read_swift_constant legacyAppBundleIdentifier)"
+LEGACY_CLEANUP_APP_NAME="$(read_swift_constant legacyCleanupAppName)"
+LEGACY_CLEANUP_EXECUTABLE="$(read_swift_constant legacyCleanupExecutableName)"
 APP="$ROOT/.build/$APP_NAME.app"
 HELPER="$APP/Contents/Library/LaunchServices/$HELPER_EXECUTABLE"
+LEGACY_CLEANUP_APP="$APP/Contents/Library/Helpers/$LEGACY_CLEANUP_APP_NAME.app"
+LEGACY_CLEANUP="$LEGACY_CLEANUP_APP/Contents/MacOS/$LEGACY_CLEANUP_EXECUTABLE"
 DIST="$ROOT/dist"
 
 APP_VERSION="${APP_VERSION:-}"
@@ -161,10 +168,10 @@ EOF
 fi
 
 mkdir -p "$DIST"
-APP_ZIP="$DIST/.$APP_NAME-$APP_VERSION-notary.zip"
-DMG="$DIST/$APP_NAME-$APP_VERSION.dmg"
+APP_ZIP="$DIST/.$RELEASE_ARTIFACT_NAME-$APP_VERSION-notary.zip"
+DMG="$DIST/$RELEASE_ARTIFACT_NAME-$APP_VERSION.dmg"
 PREVIOUS_DMG="$DMG.previous"
-STAGED_DMG="$DIST/.$APP_NAME-$APP_VERSION-staging.dmg"
+STAGED_DMG="$DIST/.$RELEASE_ARTIFACT_NAME-$APP_VERSION-staging.dmg"
 DMG_ROOT=""
 RELEASE_SUCCEEDED=false
 
@@ -201,7 +208,7 @@ PACKAGING_MODE=release \
     "$ROOT/scripts/package-menubar-app.sh" >/dev/null
 
 BUILT_DSYM_DIR="$ROOT/.build/dSYMs/$APP_VERSION-$BUILD_NUMBER"
-RELEASE_DSYM_DIR="$DIST/$APP_NAME-$APP_VERSION-$BUILD_NUMBER.dSYMs"
+RELEASE_DSYM_DIR="$DIST/$RELEASE_ARTIFACT_NAME-$APP_VERSION-$BUILD_NUMBER.dSYMs"
 if [[ ! -d "$BUILT_DSYM_DIR" ]]; then
     echo "Release packaging did not produce dSYMs: $BUILT_DSYM_DIR" >&2
     exit 1
@@ -209,10 +216,17 @@ fi
 rm -rf "$RELEASE_DSYM_DIR"
 ditto "$BUILT_DSYM_DIR" "$RELEASE_DSYM_DIR"
 
-if [[ ! -x "$APP/Contents/MacOS/$APP_EXECUTABLE" || ! -x "$HELPER" ]]; then
+if [[ ! -x "$APP/Contents/MacOS/$APP_EXECUTABLE" ||
+      ! -x "$HELPER" ||
+      ! -x "$LEGACY_CLEANUP" ]]; then
     echo "Release bundle is missing an expected executable." >&2
     exit 1
 fi
+
+codesign --force --timestamp --options runtime \
+    --sign "$IDENTITY" \
+    --identifier "$LEGACY_APP_BUNDLE_ID" \
+    "$LEGACY_CLEANUP_APP"
 
 codesign --force --timestamp --options runtime \
     --sign "$IDENTITY" \
@@ -225,6 +239,7 @@ codesign --force --timestamp --options runtime \
     "$APP"
 
 codesign --verify --strict --verbose=2 "$HELPER"
+codesign --verify --deep --strict --verbose=2 "$LEGACY_CLEANUP_APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 signature_details() {
@@ -267,8 +282,16 @@ verify_signature() {
 
 APP_TEAM="$(verify_signature "$APP" "$BUNDLE_ID")"
 HELPER_TEAM="$(verify_signature "$HELPER" "$HELPER_ID")"
-if [[ "$APP_TEAM" != "$HELPER_TEAM" ]]; then
-    echo "App/helper signing team mismatch: app='$APP_TEAM', helper='$HELPER_TEAM'" >&2
+LEGACY_CLEANUP_TEAM="$(
+    verify_signature "$LEGACY_CLEANUP_APP" "$LEGACY_APP_BUNDLE_ID"
+)"
+if [[ "$APP_TEAM" != "$HELPER_TEAM" ||
+      "$APP_TEAM" != "$LEGACY_CLEANUP_TEAM" ]]; then
+    echo "Signing team mismatch: app='$APP_TEAM', helper='$HELPER_TEAM', cleanup='$LEGACY_CLEANUP_TEAM'" >&2
+    exit 1
+fi
+if [[ "$APP_TEAM" != "$EXPECTED_TEAM_ID" ]]; then
+    echo "Unexpected signing team: '$APP_TEAM' (expected '$EXPECTED_TEAM_ID')" >&2
     exit 1
 fi
 

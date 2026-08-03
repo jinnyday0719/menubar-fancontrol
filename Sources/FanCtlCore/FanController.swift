@@ -59,7 +59,9 @@ public struct FanAutomaticControlStatus: Equatable, Sendable {
     }
 
     public var isFullyAutomatic: Bool {
-        fans.allSatisfy(\.mode.isSystemControlled) && (forceTestMode == nil || forceTestMode == 0)
+        !fans.isEmpty &&
+            fans.allSatisfy(\.mode.isSystemControlled) &&
+            (forceTestMode == nil || forceTestMode == 0)
     }
 }
 
@@ -365,6 +367,9 @@ public final class FanController: Sendable {
 
         let operationDeadline = retryDeadline()
         let count = try fanCount()
+        guard count > 0 else {
+            throw FanControlError.invalidFanCount(Double(count))
+        }
         var failures: [String] = []
 
         for fanIndex in 0..<count {

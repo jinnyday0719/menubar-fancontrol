@@ -3,6 +3,7 @@ import Dispatch
 import FanCtlCore
 import FanCtlHelperXPC
 import QuartzCore
+import Security
 import ServiceManagement
 
 @main
@@ -26,6 +27,131 @@ private enum FanCtlDefaults {
     static let menuBarTitleFormatKey = "menuBarTitleFormat"
     static let appLanguageCodeKey = "appLanguageCode"
     static let updateCheckAtLaunchEnabledKey = "updateCheckAtLaunchEnabled"
+    static let userPresetsKey = "userFanPresets"
+    static let legacyLaunchAtLoginIntentKey =
+        "menuBarFanControlLegacyLaunchAtLoginIntent"
+    static let legacyLaunchAtLoginRemovalRecordedKey =
+        "menuBarFanControlLegacyLaunchAtLoginRemovalRecorded"
+}
+
+enum LegacyPreferencesMigration {
+    private static let completedVersion = 2
+    private static let completedVersionKey =
+        "menuBarFanControlIdentifierMigrationVersion"
+    private static let copiedKeys = [
+        FanCtlDefaults.didAskLaunchAtLoginKey,
+        FanCtlDefaults.launchAtLoginEnabledKey,
+        FanCtlDefaults.menuBarTitleFormatKey,
+        FanCtlDefaults.appLanguageCodeKey,
+        FanCtlDefaults.updateCheckAtLaunchEnabledKey,
+        FanCtlDefaults.userPresetsKey
+    ]
+
+    static func stageIfNeeded(
+        defaults: UserDefaults,
+        currentBundleIdentifier: String?,
+        legacyDomain: [String: Any]?
+    ) {
+        guard currentBundleIdentifier ==
+                FanCtlHelperConstants.appBundleIdentifier,
+              defaults.integer(forKey: completedVersionKey) < completedVersion else {
+            return
+        }
+
+        if let legacyDomain {
+            let valuesToCopy = FanCtlLegacyPreferencePlanner.valuesToCopy(
+                keys: copiedKeys,
+                legacyDomain: legacyDomain
+            )
+            for (key, value) in valuesToCopy {
+                defaults.set(value, forKey: key)
+            }
+        }
+    }
+
+    static func complete(
+        defaults: UserDefaults,
+        currentBundleIdentifier: String?
+    ) {
+        guard currentBundleIdentifier ==
+                FanCtlHelperConstants.appBundleIdentifier else {
+            return
+        }
+        defaults.set(completedVersion, forKey: completedVersionKey)
+    }
+
+    static func refreshAndComplete(
+        defaults: UserDefaults,
+        currentBundleIdentifier: String?,
+        legacyDomain: [String: Any]?
+    ) {
+        stageIfNeeded(
+            defaults: defaults,
+            currentBundleIdentifier: currentBundleIdentifier,
+            legacyDomain: legacyDomain
+        )
+        complete(
+            defaults: defaults,
+            currentBundleIdentifier: currentBundleIdentifier
+        )
+    }
+}
+
+enum LegacyLaunchAtLoginIntentMigration {
+    static func reconcile(
+        defaults: UserDefaults,
+        observedLegacyStatus: FanCtlLegacyServiceStatus
+    ) {
+        guard defaults.bool(
+            forKey: FanCtlDefaults.legacyLaunchAtLoginRemovalRecordedKey
+        ),
+        defaults.object(
+            forKey: FanCtlDefaults.legacyLaunchAtLoginIntentKey
+        ) is Bool,
+        observedLegacyStatus == .inactive else {
+            clear(defaults: defaults)
+            return
+        }
+    }
+
+    static func recordSuccessfulRemoval(
+        defaults: UserDefaults,
+        removedRegistrationStatus: FanCtlLegacyServiceStatus
+    ) {
+        guard removedRegistrationStatus != .inactive else {
+            return
+        }
+        defaults.set(
+            removedRegistrationStatus == .enabled,
+            forKey: FanCtlDefaults.legacyLaunchAtLoginIntentKey
+        )
+        defaults.set(
+            true,
+            forKey:
+                FanCtlDefaults.legacyLaunchAtLoginRemovalRecordedKey
+        )
+    }
+
+    static func persistedIntent(defaults: UserDefaults) -> Bool? {
+        guard defaults.bool(
+            forKey: FanCtlDefaults.legacyLaunchAtLoginRemovalRecordedKey
+        ) else {
+            return nil
+        }
+        return defaults.object(
+            forKey: FanCtlDefaults.legacyLaunchAtLoginIntentKey
+        ) as? Bool
+    }
+
+    static func clear(defaults: UserDefaults) {
+        defaults.removeObject(
+            forKey: FanCtlDefaults.legacyLaunchAtLoginIntentKey
+        )
+        defaults.removeObject(
+            forKey:
+                FanCtlDefaults.legacyLaunchAtLoginRemovalRecordedKey
+        )
+    }
 }
 
 private enum AppLanguage: String, CaseIterable {
@@ -69,7 +195,36 @@ enum L10n {
     static var windowMenu: String { text("윈도우", "Window") }
     static var closeWindow: String { text("닫기", "Close") }
     static var launchAtLoginPromptTitle: String { text("로그인 시 열기", "Open at Login") }
-    static var launchAtLoginPromptMessage: String { text("mFanCtl을 로그인할 때 자동으로 열 수 있습니다.", "mFanCtl can open automatically when you log in.") }
+    static var launchAtLoginPromptMessage: String { text("MenuBar FanControl을 로그인할 때 자동으로 열 수 있습니다.", "MenuBar FanControl can open automatically when you log in.") }
+    static var launchAtLoginMigrationApprovalMessage: String {
+        text(
+            "이전 버전의 자동 실행 설정을 이어가려면 시스템 설정의 로그인 항목에서 MenuBar FanControl을 허용해주세요. 자동 실행을 사용하지 않고 계속할 수도 있습니다.",
+            "To preserve the previous auto-launch setting, allow MenuBar FanControl in Login Items. You can also continue without auto launch."
+        )
+    }
+    static func launchAtLoginMigrationFailedMessage(
+        reason: String
+    ) -> String {
+        text(
+            "자동 실행 설정을 옮기지 못했습니다.\n\(reason)\n\n자동 실행 없이 계속하거나 앱을 종료한 뒤 다시 시도할 수 있습니다.",
+            "The auto-launch setting could not be migrated.\n\(reason)\n\nContinue without auto launch, or quit and try again."
+        )
+    }
+    static var continueWithoutAutoLaunch: String {
+        text("자동 실행 없이 계속", "Continue Without Auto Launch")
+    }
+    static var launchAtLoginRegistrationInactive: String {
+        text(
+            "로그인 항목 등록이 활성 상태가 되지 않았습니다.",
+            "The login item registration did not become active."
+        )
+    }
+    static var unknownLaunchAtLoginStatus: String {
+        text(
+            "로그인 항목이 알 수 없는 상태를 반환했습니다.",
+            "The login item returned an unknown status."
+        )
+    }
     static var allow: String { text("허용", "Allow") }
     static var openSystemSettings: String { text("설정 열기", "Open Settings") }
     static var later: String { text("나중에", "Later") }
@@ -90,7 +245,7 @@ enum L10n {
     static var addPresetTitle: String { text("사전 설정 추가", "Add Preset") }
     static var cancel: String { text("취소", "Cancel") }
     static var launchAtLoginSection: String { text("  자동 실행", "  Auto Launch") }
-    static var launchAtLoginSetting: String { text("로그인 시 mFanCtl을 자동 실행", "Open mFanCtl at login") }
+    static var launchAtLoginSetting: String { text("로그인 시 MenuBar FanControl을 자동 실행", "Open MenuBar FanControl at login") }
     static var checkForUpdatesAtLaunch: String { text("앱 시작 시 GitHub 릴리즈 확인", "Check GitHub Releases at launch") }
     static var languageSection: String { text("  언어", "  Language") }
     static var appLanguage: String { text("앱 언어", "App language") }
@@ -125,6 +280,24 @@ enum L10n {
     static var missingPreset: String { text("사전 설정을 찾을 수 없습니다.", "Preset not found.") }
     static var helperUnavailable: String { text("팬 제어 helper가 설치되어 있지 않습니다.", "Fan control helper is not installed.") }
     static var helperRegistrationFailed: String { text("팬 제어 helper를 등록하지 못했습니다.", "Could not register the fan control helper.") }
+    static var signedReleaseRequired: String {
+        text(
+            "팬 제어에는 서명된 정식 버전이 필요합니다.",
+            "Fan control requires a signed release build."
+        )
+    }
+    static var installInApplicationsRequired: String {
+        text(
+            "팬 제어를 사용하려면 앱을 Applications 폴더로 옮겨주세요.",
+            "Move the app to the Applications folder to control fans."
+        )
+    }
+    static var invalidBundledHelper: String {
+        text(
+            "앱에 포함된 팬 제어 helper를 확인할 수 없습니다.",
+            "The bundled fan control helper could not be verified."
+        )
+    }
     static var invalidHelperResponse: String { text("helper 응답이 올바르지 않습니다.", "Invalid helper response.") }
     static var incompatibleHelper: String {
         text(
@@ -135,11 +308,11 @@ enum L10n {
     static var helperApprovalPromptTitle: String { text("백그라운드 앱 허용", "Allow Background App") }
     static var helperApprovalPromptMessage: String {
         text(
-            "팬 제어를 사용하려면 시스템 설정에서 mFanCtl을 백그라운드 앱으로 허용해야 합니다.",
-            "To control fans, allow mFanCtl as a background app in System Settings."
+            "팬 제어를 사용하려면 시스템 설정에서 MenuBar FanControl을 백그라운드 앱으로 허용해야 합니다.",
+            "To control fans, allow MenuBar FanControl as a background app in System Settings."
         )
     }
-    static var helperRequiresApproval: String { text("백그라운드 앱에서 mFanCtl을 허용해주세요.", "Allow mFanCtl in Background Apps.") }
+    static var helperRequiresApproval: String { text("백그라운드 앱에서 MenuBar FanControl을 허용해주세요.", "Allow MenuBar FanControl in Background Apps.") }
     static var presetDataUnreadable: String { text("저장된 사전 설정을 읽을 수 없습니다.", "Saved presets could not be read.") }
     static var manualFanModeDetected: String {
         text(
@@ -192,15 +365,15 @@ enum L10n {
 
     static func updateAvailableMessage(version: String) -> String {
         text(
-            "mFanCtl \(version)을 사용할 수 있습니다.\nGitHub에서 최신 버전을 다운로드하세요.",
-            "mFanCtl \(version) is available.\nDownload the latest version from GitHub."
+            "MenuBar FanControl \(version)을 사용할 수 있습니다.\nGitHub에서 최신 버전을 다운로드하세요.",
+            "MenuBar FanControl \(version) is available.\nDownload the latest version from GitHub."
         )
     }
 
     static func noUpdatesMessage(version: String) -> String {
         text(
-            "현재 mFanCtl \(version)을 사용 중입니다.",
-            "You're currently using mFanCtl \(version)."
+            "현재 MenuBar FanControl \(version)을 사용 중입니다.",
+            "You're currently using MenuBar FanControl \(version)."
         )
     }
 
@@ -210,6 +383,64 @@ enum L10n {
             "Unable to check for updates.\n\(reason)"
         )
     }
+
+    static var brandMigrationTitle: String {
+        text("이전 버전 정리", "Remove the Previous Version")
+    }
+
+    static var brandMigrationMessage: String {
+        text(
+            "이전 버전 앱이 함께 설치되어 있습니다. 두 앱이 동시에 팬을 제어하지 않도록 이전 앱을 정상 종료하고 기존 팬 helper와 로그인 항목을 해제한 다음 휴지통으로 옮깁니다.",
+            "A previous version is still installed. To prevent two apps from controlling the fans at the same time, MenuBar FanControl will quit it normally, unregister its fan helper and login item, and then move it to the Trash."
+        )
+    }
+
+    static var cleanUpAndContinue: String {
+        text("정리하고 계속", "Remove and Continue")
+    }
+
+    static var quitNewApp: String {
+        text("앱 종료", "Quit")
+    }
+
+    static var moveToApplicationsTitle: String {
+        text("Applications 폴더에서 실행해주세요", "Run from the Applications Folder")
+    }
+
+    static var moveToApplicationsMessage: String {
+        text(
+            "먼저 MenuBar FanControl을 Applications 폴더로 옮긴 뒤 다시 열어주세요. 현재 위치에서는 이전 버전을 안전하게 교체할 수 없습니다.",
+            "Move MenuBar FanControl to the Applications folder and open it again. The previous version cannot be replaced safely from the current location."
+        )
+    }
+
+    static func brandMigrationFailed(reason: String) -> String {
+        text(
+            "이전 버전을 안전하게 정리하지 못했습니다.\n\(reason)\n\n이전 앱이나 helper를 직접 삭제하지 마세요. 이전 버전을 정상 종료한 뒤 다시 시도하고, 계속 실패하면 Mac을 재시동한 다음 MenuBar FanControl을 다시 열어주세요.",
+            "The previous version could not be removed safely.\n\(reason)\n\nDo not delete the previous app or helper manually. Quit the previous version normally and try again. If it still fails, restart your Mac and reopen MenuBar FanControl."
+        )
+    }
+
+    static var brandMigrationQuitTimedOut: String {
+        text(
+            "이전 버전이 제한 시간 안에 종료되지 않았습니다.",
+            "The previous version did not quit within the allowed time."
+        )
+    }
+
+    static var brandMigrationIdentityMismatch: String {
+        text(
+            "이전 앱의 서명 또는 식별자가 현재 앱과 일치하지 않습니다.",
+            "The previous app's signature or identifier does not match this app."
+        )
+    }
+
+    static var brandMigrationLegacyLocationUnsupported: String {
+        text(
+            "이전 버전이 Applications 폴더 밖에서 실행 중이거나 자동으로 휴지통에 옮길 수 없는 위치에 있습니다.",
+            "The previous version is running outside the Applications folder or cannot be moved to the Trash automatically."
+        )
+    }
 }
 
 private extension Notification.Name {
@@ -217,9 +448,9 @@ private extension Notification.Name {
 }
 
 private enum AppLinks {
-    static let githubRepository = URL(string: "https://github.com/jinnyday0719/mfanctl")!
-    static let githubLatestRelease = URL(string: "https://github.com/jinnyday0719/mfanctl/releases/latest")!
-    static let githubLatestReleaseAPI = URL(string: "https://api.github.com/repos/jinnyday0719/mfanctl/releases/latest")!
+    static let githubRepository = URL(string: "https://github.com/jinnyday0719/menubar-fancontrol")!
+    static let githubLatestRelease = URL(string: "https://github.com/jinnyday0719/menubar-fancontrol/releases/latest")!
+    static let githubLatestReleaseAPI = URL(string: "https://api.github.com/repos/jinnyday0719/menubar-fancontrol/releases/latest")!
 }
 
 private enum AppPreferences {
@@ -298,7 +529,7 @@ private enum UpdateChecker {
     static func latestRelease() async throws -> GitHubRelease {
         var request = URLRequest(url: AppLinks.githubLatestReleaseAPI)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        request.setValue("mFanCtl", forHTTPHeaderField: "User-Agent")
+        request.setValue("MenuBar-FanControl", forHTTPHeaderField: "User-Agent")
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -309,6 +540,747 @@ private enum UpdateChecker {
         }
         return try JSONDecoder().decode(GitHubRelease.self, from: data)
     }
+}
+
+@MainActor
+private enum BrandMigration {
+    private static let completedVersion = 2
+    private static let completedVersionKey = "menuBarFanControlBrandMigrationVersion"
+    private static let legacyBundleFilename = "mFanCtl.app"
+    private static let legacyDisplayName = "mFanCtl"
+    private static let legacyExecutableName = "mFanCtl"
+
+    static func runIfNeeded() async -> Bool {
+        let needsRegistrationRefresh =
+            UserDefaults.standard.integer(forKey: completedVersionKey) < completedVersion
+
+        let currentBundleURL = Bundle.main.bundleURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+
+        // Unsigned development bundles have no stable TeamIdentifier and must
+        // never move an installed, signed application.
+        guard Bundle.main.object(
+            forInfoDictionaryKey: "FanControlDistributionBuild"
+        ) as? Bool == true,
+        Bundle.main.bundleIdentifier ==
+            FanCtlHelperConstants.appBundleIdentifier,
+        let currentTeamIdentifier = signingTeamIdentifier(for: currentBundleURL),
+        currentTeamIdentifier == FanCtlHelperConstants.developerTeamIdentifier else {
+            return true
+        }
+
+        LegacyPreferencesMigration.stageIfNeeded(
+            defaults: .standard,
+            currentBundleIdentifier: Bundle.main.bundleIdentifier,
+            legacyDomain: UserDefaults.standard.persistentDomain(
+                forName: FanCtlHelperConstants.legacyAppBundleIdentifier
+            )
+        )
+
+        let otherApplications = NSRunningApplication
+            .runningApplications(
+                withBundleIdentifier: FanCtlHelperConstants.legacyAppBundleIdentifier
+            )
+            .filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+
+        var legacyBundleURLs = knownLegacyBundleURLs()
+        for application in otherApplications {
+            guard let bundleURL = application.bundleURL,
+                  isLegacyBundle(bundleURL) else {
+                continue
+            }
+            legacyBundleURLs.insert(
+                bundleURL.resolvingSymlinksInPath().standardizedFileURL
+            )
+        }
+        legacyBundleURLs.remove(currentBundleURL)
+
+        let existingLegacyBundleURLs = legacyBundleURLs
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+            .sorted { $0.path < $1.path }
+
+        guard !existingLegacyBundleURLs.isEmpty || !otherApplications.isEmpty else {
+            if needsRegistrationRefresh {
+                let inspectedReport: FanCtlLegacyCleanupReport
+                do {
+                    inspectedReport =
+                        try await FanCtlLegacyServiceCleanupRunner.inspect()
+                } catch {
+                    showMigrationFailure(error.localizedDescription)
+                    return false
+                }
+                LegacyLaunchAtLoginIntentMigration.reconcile(
+                    defaults: .standard,
+                    observedLegacyStatus:
+                        inspectedReport.initialLoginItemStatus
+                )
+                let hasEnabledLaunchAtLoginRegistration =
+                    SMAppService.mainApp.status == .enabled
+                let hasLegacyPreferences = UserDefaults.standard.persistentDomain(
+                    forName: FanCtlHelperConstants.legacyAppBundleIdentifier
+                ) != nil
+                let hasPersistedLaunchAtLoginIntent =
+                    LegacyLaunchAtLoginIntentMigration.persistedIntent(
+                        defaults: .standard
+                    ) != nil
+                let hasLegacyService =
+                    inspectedReport.initialDaemonStatus != .inactive ||
+                    inspectedReport.initialLoginItemStatus != .inactive ||
+                    inspectedReport.manualHelperInstallDetected
+                if (
+                    UserDefaults.standard.bool(
+                        forKey: FanCtlDefaults.launchAtLoginEnabledKey
+                    ) || hasEnabledLaunchAtLoginRegistration ||
+                        hasLegacyPreferences ||
+                        hasPersistedLaunchAtLoginIntent ||
+                        hasLegacyService
+                ), !FanCtlApplicationLocation.isInstalledApplication(currentBundleURL) {
+                    showAlert(
+                        title: L10n.moveToApplicationsTitle,
+                        message: L10n.moveToApplicationsMessage
+                    )
+                    return false
+                }
+                guard noLegacyApplicationsAreRunning() else {
+                    showMigrationFailure(
+                        L10n.brandMigrationQuitTimedOut
+                    )
+                    return false
+                }
+                guard let cleanupReport = await cleanUpLegacyServices(
+                    inspectedReport: inspectedReport
+                ) else {
+                    return false
+                }
+                guard noLegacyApplicationsAreRunning() else {
+                    showMigrationFailure(
+                        L10n.brandMigrationQuitTimedOut
+                    )
+                    return false
+                }
+                completePreferenceMigration()
+                guard await refreshLaunchAtLoginRegistrationIfNeeded(
+                    legacyLoginItemStatus:
+                        cleanupReport.initialLoginItemStatus
+                ) else {
+                    return false
+                }
+                rememberCompletion()
+            }
+            return true
+        }
+
+        guard FanCtlApplicationLocation.isInstalledApplication(currentBundleURL) else {
+            showAlert(
+                title: L10n.moveToApplicationsTitle,
+                message: L10n.moveToApplicationsMessage
+            )
+            return false
+        }
+
+        let legacyApplications = otherApplications.filter {
+            guard let bundleURL = $0.bundleURL else {
+                return false
+            }
+            return isLegacyBundle(bundleURL)
+        }
+        guard legacyApplications.count == otherApplications.count else {
+            showMigrationFailure(L10n.brandMigrationQuitTimedOut)
+            return false
+        }
+
+        guard existingLegacyBundleURLs.allSatisfy({
+            isTrustedLegacyBundle(
+                $0,
+                currentTeamIdentifier: currentTeamIdentifier
+            )
+        }) else {
+            showMigrationFailure(L10n.brandMigrationIdentityMismatch)
+            return false
+        }
+        guard existingLegacyBundleURLs.allSatisfy({
+            FanCtlApplicationLocation.isInstalledApplication($0) &&
+                FileManager.default.isDeletableFile(atPath: $0.path)
+        }) else {
+            showMigrationFailure(L10n.brandMigrationLegacyLocationUnsupported)
+            return false
+        }
+
+        guard confirmCleanup() else {
+            return false
+        }
+
+        let allowedLegacyBundleURLs = Set(existingLegacyBundleURLs)
+        guard await terminateLegacyApplications(
+            allowedBundleURLs: allowedLegacyBundleURLs,
+            currentTeamIdentifier: currentTeamIdentifier
+        ) else {
+            return false
+        }
+
+        guard let cleanupReport = await cleanUpLegacyServices() else {
+            return false
+        }
+        guard await terminateLegacyApplications(
+            allowedBundleURLs: allowedLegacyBundleURLs,
+            currentTeamIdentifier: currentTeamIdentifier
+        ) else {
+            return false
+        }
+        // The previous helper is gone at this point, but an unsequenced
+        // v0.3.0/v0.3.1 request may have completed while its client process
+        // was being terminated. Verify once more after both sides of the old
+        // control path have exited and use the active helper for recovery if
+        // that final barrier finds a manual state.
+        guard await cleanUpLegacyServices(
+            requiresFinalAutomaticVerification: true
+        ) != nil else {
+            return false
+        }
+
+        do {
+            for legacyBundleURL in existingLegacyBundleURLs {
+                guard isTrustedLegacyBundle(
+                    legacyBundleURL,
+                    currentTeamIdentifier: currentTeamIdentifier
+                ) else {
+                    showMigrationFailure(
+                        L10n.brandMigrationIdentityMismatch
+                    )
+                    return false
+                }
+                var resultingURL: NSURL?
+                try FileManager.default.trashItem(
+                    at: legacyBundleURL,
+                    resultingItemURL: &resultingURL
+                )
+            }
+        } catch {
+            showMigrationFailure(error.localizedDescription)
+            return false
+        }
+        guard await terminateLegacyApplications(
+            allowedBundleURLs: allowedLegacyBundleURLs,
+            currentTeamIdentifier: currentTeamIdentifier
+        ) else {
+            return false
+        }
+
+        completePreferenceMigration()
+        guard await refreshLaunchAtLoginRegistrationIfNeeded(
+            legacyLoginItemStatus: cleanupReport.initialLoginItemStatus
+        ) else {
+            return false
+        }
+        rememberCompletion()
+        return true
+    }
+
+    private static func knownLegacyBundleURLs() -> Set<URL> {
+        var urls: Set<URL> = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true)
+                .appendingPathComponent(legacyBundleFilename, isDirectory: true)
+                .standardizedFileURL
+        ]
+        urls.insert(
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Applications", isDirectory: true)
+                .appendingPathComponent(legacyBundleFilename, isDirectory: true)
+                .standardizedFileURL
+        )
+        for bundleURL in NSWorkspace.shared.urlsForApplications(
+            withBundleIdentifier: FanCtlHelperConstants.legacyAppBundleIdentifier
+        ) where isLegacyBundle(bundleURL) &&
+            FanCtlApplicationLocation.isInstalledApplication(bundleURL) {
+            urls.insert(
+                bundleURL.resolvingSymlinksInPath().standardizedFileURL
+            )
+        }
+        return urls
+    }
+
+    private static func terminateLegacyApplications(
+        allowedBundleURLs: Set<URL>,
+        currentTeamIdentifier: String
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(35)
+
+        while Date() < deadline {
+            let applications = NSRunningApplication.runningApplications(
+                withBundleIdentifier:
+                    FanCtlHelperConstants.legacyAppBundleIdentifier
+            )
+            guard !applications.isEmpty else {
+                return true
+            }
+
+            for application in applications {
+                guard let bundleURL = application.bundleURL else {
+                    showMigrationFailure(
+                        L10n.brandMigrationIdentityMismatch
+                    )
+                    return false
+                }
+                let normalizedURL = bundleURL
+                    .resolvingSymlinksInPath()
+                    .standardizedFileURL
+                guard allowedBundleURLs.contains(normalizedURL),
+                      isTrustedLegacyBundle(
+                          normalizedURL,
+                          currentTeamIdentifier: currentTeamIdentifier
+                      ) else {
+                    showMigrationFailure(
+                        L10n.brandMigrationIdentityMismatch
+                    )
+                    return false
+                }
+                _ = application.terminate()
+            }
+
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+
+        showMigrationFailure(L10n.brandMigrationQuitTimedOut)
+        return false
+    }
+
+    private static func noLegacyApplicationsAreRunning() -> Bool {
+        NSRunningApplication.runningApplications(
+            withBundleIdentifier:
+                FanCtlHelperConstants.legacyAppBundleIdentifier
+        ).isEmpty
+    }
+
+    private static func isLegacyBundle(_ bundleURL: URL) -> Bool {
+        if bundleURL.lastPathComponent == legacyBundleFilename {
+            return true
+        }
+        guard let bundle = Bundle(url: bundleURL),
+              bundle.bundleIdentifier ==
+                  FanCtlHelperConstants.legacyAppBundleIdentifier else {
+            return false
+        }
+        let displayName = bundle.object(
+            forInfoDictionaryKey: "CFBundleDisplayName"
+        ) as? String
+        let executableName = bundle.object(
+            forInfoDictionaryKey: "CFBundleExecutable"
+        ) as? String
+        return displayName == legacyDisplayName ||
+            executableName == legacyExecutableName
+    }
+
+    private static func isTrustedLegacyBundle(
+        _ bundleURL: URL,
+        currentTeamIdentifier: String
+    ) -> Bool {
+        guard isLegacyBundle(bundleURL),
+              Bundle(url: bundleURL)?.bundleIdentifier ==
+                  FanCtlHelperConstants.legacyAppBundleIdentifier,
+              signingTeamIdentifier(for: bundleURL) == currentTeamIdentifier else {
+            return false
+        }
+        return true
+    }
+
+    private static func signingTeamIdentifier(for bundleURL: URL) -> String? {
+        var staticCode: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(
+            bundleURL as CFURL,
+            SecCSFlags(),
+            &staticCode
+        ) == errSecSuccess,
+        let staticCode,
+        SecStaticCodeCheckValidity(staticCode, SecCSFlags(), nil) == errSecSuccess else {
+            return nil
+        }
+
+        var information: CFDictionary?
+        let flags = SecCSFlags(rawValue: kSecCSSigningInformation)
+        guard SecCodeCopySigningInformation(staticCode, flags, &information) == errSecSuccess,
+              let dictionary = information as? [String: Any],
+              let teamIdentifier = dictionary[kSecCodeInfoTeamIdentifier as String] as? String,
+              !teamIdentifier.isEmpty else {
+            return nil
+        }
+        return teamIdentifier
+    }
+
+    private static func refreshLaunchAtLoginRegistrationIfNeeded(
+        legacyLoginItemStatus: FanCtlLegacyServiceStatus
+    ) async -> Bool {
+        let service = SMAppService.mainApp
+        let initialStatus = service.status
+        let shouldRemainEnabled =
+            FanCtlLaunchAtLoginMigrationPlanner.shouldRemainEnabled(
+                persistedMigrationIntent:
+                    LegacyLaunchAtLoginIntentMigration.persistedIntent(
+                        defaults: .standard
+                    ),
+                explicitPreference: UserDefaults.standard.bool(
+                    forKey: FanCtlDefaults.launchAtLoginEnabledKey
+                ),
+                currentRegistrationStatus: legacyStatus(initialStatus),
+                legacyRegistrationStatus: legacyLoginItemStatus
+            )
+
+        guard shouldRemainEnabled else {
+            switch initialStatus {
+            case .enabled, .requiresApproval:
+                do {
+                    try await unregister(service)
+                } catch {
+                    NSLog(
+                        "MenuBar FanControl failed to unregister launch at login: \(error.localizedDescription)"
+                    )
+                    return false
+                }
+            case .notRegistered, .notFound:
+                break
+            @unknown default:
+                break
+            }
+            UserDefaults.standard.set(
+                false,
+                forKey: FanCtlDefaults.launchAtLoginEnabledKey
+            )
+            return true
+        }
+
+        switch initialStatus {
+        case .enabled:
+            UserDefaults.standard.set(
+                true,
+                forKey: FanCtlDefaults.launchAtLoginEnabledKey
+            )
+            return true
+        case .requiresApproval:
+            return await resolveLaunchAtLoginApproval(service)
+        case .notRegistered, .notFound:
+            break
+        @unknown default:
+            break
+        }
+
+        do {
+            try service.register()
+            switch service.status {
+            case .enabled:
+                UserDefaults.standard.set(
+                    true,
+                    forKey: FanCtlDefaults.launchAtLoginEnabledKey
+                )
+                return true
+            case .requiresApproval:
+                return await resolveLaunchAtLoginApproval(service)
+            case .notRegistered, .notFound:
+                return await resolveLaunchAtLoginFailure(
+                    service,
+                    reason: L10n.launchAtLoginRegistrationInactive
+                )
+            @unknown default:
+                return await resolveLaunchAtLoginFailure(
+                    service,
+                    reason: L10n.unknownLaunchAtLoginStatus
+                )
+            }
+        } catch {
+            NSLog(
+                "MenuBar FanControl failed to migrate launch at login: \(error.localizedDescription)"
+            )
+            if service.status == .requiresApproval {
+                return await resolveLaunchAtLoginApproval(service)
+            }
+            return await resolveLaunchAtLoginFailure(
+                service,
+                reason: error.localizedDescription
+            )
+        }
+    }
+
+    private static func resolveLaunchAtLoginApproval(
+        _ service: SMAppService
+    ) async -> Bool {
+        let alert = NSAlert()
+        alert.messageText = L10n.launchAtLoginPromptTitle
+        alert.informativeText =
+            L10n.launchAtLoginMigrationApprovalMessage
+        let openButton = alert.addButton(
+            withTitle: L10n.openSystemSettings
+        )
+        openButton.keyEquivalent = "\r"
+        alert.addButton(withTitle: L10n.continueWithoutAutoLaunch)
+
+        guard runFrontmost(alert) != .alertFirstButtonReturn else {
+            SMAppService.openSystemSettingsLoginItems()
+            return false
+        }
+        return await disableLaunchAtLoginForMigration(service)
+    }
+
+    private static func resolveLaunchAtLoginFailure(
+        _ service: SMAppService,
+        reason: String
+    ) async -> Bool {
+        let alert = NSAlert()
+        alert.messageText = L10n.launchAtLoginPromptTitle
+        alert.informativeText =
+            L10n.launchAtLoginMigrationFailedMessage(reason: reason)
+        let continueButton = alert.addButton(
+            withTitle: L10n.continueWithoutAutoLaunch
+        )
+        continueButton.keyEquivalent = "\r"
+        alert.addButton(withTitle: L10n.quitNewApp)
+
+        guard runFrontmost(alert) == .alertFirstButtonReturn else {
+            return false
+        }
+        return await disableLaunchAtLoginForMigration(service)
+    }
+
+    private static func disableLaunchAtLoginForMigration(
+        _ service: SMAppService
+    ) async -> Bool {
+        switch service.status {
+        case .enabled, .requiresApproval:
+            do {
+                try await unregister(service)
+            } catch {
+                showMigrationFailure(error.localizedDescription)
+                return false
+            }
+        case .notRegistered, .notFound:
+            break
+        @unknown default:
+            showMigrationFailure(
+                L10n.unknownLaunchAtLoginStatus
+            )
+            return false
+        }
+        UserDefaults.standard.set(
+            false,
+            forKey: FanCtlDefaults.launchAtLoginEnabledKey
+        )
+        UserDefaults.standard.set(
+            false,
+            forKey: FanCtlDefaults.legacyLaunchAtLoginIntentKey
+        )
+        return true
+    }
+
+    private static func legacyStatus(
+        _ status: SMAppService.Status
+    ) -> FanCtlLegacyServiceStatus {
+        switch status {
+        case .enabled:
+            .enabled
+        case .requiresApproval:
+            .requiresApproval
+        case .notRegistered, .notFound:
+            .inactive
+        @unknown default:
+            .requiresApproval
+        }
+    }
+
+    private static func unregister(_ service: SMAppService) async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Swift.Error>) in
+            service.unregister { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
+    private static func cleanUpLegacyServices(
+        inspectedReport providedInspection:
+            FanCtlLegacyCleanupReport? = nil,
+        requiresFinalAutomaticVerification: Bool = false
+    )
+        async -> FanCtlLegacyCleanupReport? {
+        do {
+            let inspectedReport: FanCtlLegacyCleanupReport
+            if let providedInspection {
+                inspectedReport = providedInspection
+            } else {
+                inspectedReport =
+                    try await FanCtlLegacyServiceCleanupRunner.inspect()
+            }
+            LegacyLaunchAtLoginIntentMigration.reconcile(
+                defaults: .standard,
+                observedLegacyStatus:
+                    inspectedReport.initialLoginItemStatus
+            )
+
+            let cleanupReport =
+                try await FanCtlLegacyServiceCleanupRunner.run(
+                    automaticAlreadyRestored:
+                        requiresFinalAutomaticVerification
+                )
+            var successfulCleanupLoginItemStatus =
+                cleanupReport.initialLoginItemStatus
+            if !cleanupReport.requiresActiveHelperRecovery {
+                LegacyLaunchAtLoginIntentMigration.recordSuccessfulRemoval(
+                    defaults: .standard,
+                    removedRegistrationStatus:
+                        successfulCleanupLoginItemStatus
+                )
+            }
+
+            if cleanupReport.requiresActiveHelperRecovery ||
+                cleanupReport.manualHelperInstallDetected {
+                try await prepareActiveHelperForLegacyCleanup()
+            }
+
+            if cleanupReport.requiresActiveHelperRecovery {
+                _ = try await FanCtlHelperClient.send(
+                    "SET_AUTOMATIC",
+                    timeout: FanCtlHelperClient.automaticFallbackTimeout
+                )
+                let completedReport =
+                    try await FanCtlLegacyServiceCleanupRunner.run(
+                        automaticAlreadyRestored: true
+                    )
+                guard !completedReport.requiresActiveHelperRecovery else {
+                    throw LegacyCleanupRunnerError.cleanupFailed(
+                        "Automatic fan control could not be verified before removing the previous helper."
+                    )
+                }
+                if completedReport.initialLoginItemStatus != .inactive {
+                    successfulCleanupLoginItemStatus =
+                        completedReport.initialLoginItemStatus
+                }
+                LegacyLaunchAtLoginIntentMigration.recordSuccessfulRemoval(
+                    defaults: .standard,
+                    removedRegistrationStatus:
+                        successfulCleanupLoginItemStatus
+                )
+            }
+
+            if cleanupReport.manualHelperInstallDetected {
+                _ = try await FanCtlHelperClient.send(
+                    "REMOVE_LEGACY_MANUAL_HELPER",
+                    timeout: FanCtlHelperClient.fanCommandTimeout
+                )
+            }
+
+            if cleanupReport.requiresActiveHelperRecovery ||
+                cleanupReport.manualHelperInstallDetected {
+                let verificationReport =
+                    try await FanCtlLegacyServiceCleanupRunner.run(
+                        automaticAlreadyRestored: true
+                    )
+                guard !verificationReport.requiresActiveHelperRecovery,
+                      !verificationReport.manualHelperInstallDetected,
+                      verificationReport.initialDaemonStatus == .inactive,
+                      verificationReport.initialLoginItemStatus == .inactive else {
+                    throw LegacyCleanupRunnerError.cleanupFailed(
+                        "A previous helper or background registration is still present."
+                    )
+                }
+            }
+
+            return FanCtlLegacyCleanupReport(
+                initialDaemonStatus:
+                    inspectedReport.initialDaemonStatus,
+                initialLoginItemStatus:
+                    successfulCleanupLoginItemStatus,
+                manualHelperInstallDetected:
+                    cleanupReport.manualHelperInstallDetected,
+                requiresActiveHelperRecovery:
+                    cleanupReport.requiresActiveHelperRecovery
+            )
+        } catch InstallError.requiresApproval {
+            showHelperApprovalRequired()
+            return nil
+        } catch {
+            showMigrationFailure(error.localizedDescription)
+            return nil
+        }
+    }
+
+    private static func prepareActiveHelperForLegacyCleanup() async throws {
+        try await FanCtlHelperInstaller.install()
+        FanCtlHelperClient.invalidateConnection()
+        try await FanCtlHelperClient.waitUntilAvailable(timeout: 10)
+    }
+
+    private static func showHelperApprovalRequired() {
+        let alert = NSAlert()
+        alert.messageText = L10n.helperApprovalPromptTitle
+        alert.informativeText = L10n.helperApprovalPromptMessage
+        let openButton = alert.addButton(withTitle: L10n.openSystemSettings)
+        openButton.keyEquivalent = "\r"
+        alert.addButton(withTitle: L10n.quitNewApp)
+        if runFrontmost(alert) == .alertFirstButtonReturn {
+            SMAppService.openSystemSettingsLoginItems()
+        }
+    }
+
+    private static func completePreferenceMigration() {
+        guard Bundle.main.bundleIdentifier ==
+                FanCtlHelperConstants.appBundleIdentifier else {
+            return
+        }
+        LegacyPreferencesMigration.refreshAndComplete(
+            defaults: .standard,
+            currentBundleIdentifier: Bundle.main.bundleIdentifier,
+            legacyDomain: UserDefaults.standard.persistentDomain(
+                forName: FanCtlHelperConstants.legacyAppBundleIdentifier
+            )
+        )
+        UserDefaults.standard.removePersistentDomain(
+            forName: FanCtlHelperConstants.legacyAppBundleIdentifier
+        )
+    }
+
+    private static func confirmCleanup() -> Bool {
+        let alert = NSAlert()
+        alert.messageText = L10n.brandMigrationTitle
+        alert.informativeText = L10n.brandMigrationMessage
+        let continueButton = alert.addButton(withTitle: L10n.cleanUpAndContinue)
+        continueButton.keyEquivalent = "\r"
+        alert.addButton(withTitle: L10n.quitNewApp)
+        return runFrontmost(alert) == .alertFirstButtonReturn
+    }
+
+    private static func showMigrationFailure(_ reason: String) {
+        showAlert(
+            title: L10n.brandMigrationTitle,
+            message: L10n.brandMigrationFailed(reason: reason)
+        )
+    }
+
+    private static func showAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: L10n.quitNewApp)
+        _ = runFrontmost(alert)
+    }
+
+    private static func runFrontmost(_ alert: NSAlert) -> NSApplication.ModalResponse {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        alert.layout()
+        alert.window.level = .floating
+        alert.window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        centerWindowOnActiveScreen(alert.window)
+        alert.window.orderFrontRegardless()
+        return alert.runModal()
+    }
+
+    private static func rememberCompletion() {
+        UserDefaults.standard.set(completedVersion, forKey: completedVersionKey)
+        LegacyLaunchAtLoginIntentMigration.clear(
+            defaults: .standard
+        )
+    }
+
 }
 
 @MainActor
@@ -329,8 +1301,23 @@ private func centerWindowOnActiveScreen(_ window: NSWindow) {
 }
 
 @MainActor
+private func presentInstallLocationAlert() {
+    let alert = NSAlert()
+    alert.messageText = L10n.moveToApplicationsTitle
+    alert.informativeText = L10n.installInApplicationsRequired
+    alert.addButton(withTitle: L10n.ok)
+    NSApplication.shared.activate(ignoringOtherApps: true)
+    alert.layout()
+    alert.window.level = .floating
+    alert.window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+    centerWindowOnActiveScreen(alert.window)
+    alert.window.orderFrontRegardless()
+    alert.runModal()
+}
+
+@MainActor
 final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
-    private let model = FanCtlMenuBarModel()
+    private var model: FanCtlMenuBarModel!
     private let menu = NSMenu()
     private var statusItem: NSStatusItem?
     private var presetMenuItems: [FanPreset: NSMenuItem] = [:]
@@ -347,8 +1334,22 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
     private var wasLidClosed = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        installMainMenu()
         NSApplication.shared.setActivationPolicy(.accessory)
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+            guard await BrandMigration.runIfNeeded() else {
+                NSApplication.shared.terminate(nil)
+                return
+            }
+            startApplication()
+        }
+    }
+
+    private func startApplication() {
+        model = FanCtlMenuBarModel()
+        installMainMenu()
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(languageDidChange(_:)),
@@ -389,6 +1390,9 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model else {
+            return .terminateNow
+        }
         guard !isRestoringAutomaticBeforeTermination else {
             return .terminateNow
         }
@@ -402,12 +1406,12 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
-        model.recheckHelperApprovalIfNeeded()
+        model?.recheckHelperApprovalIfNeeded()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         stopLidStateMonitoring()
-        model.invalidateTimers()
+        model?.invalidateTimers()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         DistributedNotificationCenter.default().removeObserver(self)
         NotificationCenter.default.removeObserver(self)
@@ -427,7 +1431,7 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
         let appMenuItem = NSMenuItem()
         mainMenu.addItem(appMenuItem)
 
-        let appMenu = NSMenu(title: "mFanCtl")
+        let appMenu = NSMenu(title: FanCtlHelperConstants.appName)
         appMenuItem.submenu = appMenu
 
         let settingsItem = makePlainShortcutItem(
@@ -474,13 +1478,21 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
         alert.addButton(withTitle: L10n.later)
 
         let response = runFrontmost(alert)
-        UserDefaults.standard.set(true, forKey: FanCtlDefaults.didAskLaunchAtLoginKey)
 
         if response == .alertFirstButtonReturn {
-            UserDefaults.standard.set(enableLaunchAtLogin(), forKey: FanCtlDefaults.launchAtLoginEnabledKey)
+            let enabled = enableLaunchAtLogin()
+            UserDefaults.standard.set(
+                enabled,
+                forKey: FanCtlDefaults.launchAtLoginEnabledKey
+            )
+            UserDefaults.standard.set(
+                enabled,
+                forKey: FanCtlDefaults.didAskLaunchAtLoginKey
+            )
         } else {
             disableLaunchAtLogin()
             UserDefaults.standard.set(false, forKey: FanCtlDefaults.launchAtLoginEnabledKey)
+            UserDefaults.standard.set(true, forKey: FanCtlDefaults.didAskLaunchAtLoginKey)
         }
     }
 
@@ -506,6 +1518,10 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
     }
 
     private func enableLaunchAtLogin() -> Bool {
+        guard FanCtlApplicationLocation.isInstalledApplication() else {
+            presentInstallLocationAlert()
+            return false
+        }
         let service = SMAppService.mainApp
         guard service.status != .enabled else {
             return true
@@ -515,8 +1531,8 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
             try service.register()
             return true
         } catch {
-            NSLog("mFanCtl failed to register launch at login: \(error.localizedDescription)")
-            return false
+            NSLog("MenuBar FanControl failed to register launch at login: \(error.localizedDescription)")
+            return service.status == .requiresApproval
         }
     }
 
@@ -529,7 +1545,7 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
         do {
             try service.unregister()
         } catch {
-            NSLog("mFanCtl failed to unregister launch at login: \(error.localizedDescription)")
+            NSLog("MenuBar FanControl failed to unregister launch at login: \(error.localizedDescription)")
         }
     }
 
@@ -817,7 +1833,7 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
         item.isEnabled = false
 
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 180, height: 26))
-        let label = NSTextField(labelWithString: "mFanCtl")
+        let label = NSTextField(labelWithString: FanCtlHelperConstants.appName)
         label.font = .boldSystemFont(ofSize: NSFont.systemFontSize)
         label.textColor = .labelColor
         label.frame = NSRect(x: 18, y: 4, width: 144, height: 18)
@@ -2446,6 +3462,13 @@ private final class FanCtlSettingsViewController: NSViewController, NSToolbarDel
         let shouldEnable = sender.state == .on
         let previousValue = UserDefaults.standard.bool(forKey: FanCtlDefaults.launchAtLoginEnabledKey)
 
+        guard !shouldEnable || FanCtlApplicationLocation.isInstalledApplication() else {
+            UserDefaults.standard.set(false, forKey: FanCtlDefaults.launchAtLoginEnabledKey)
+            sender.state = .off
+            presentInstallLocationAlert()
+            return
+        }
+
         do {
             if shouldEnable {
                 if SMAppService.mainApp.status != .enabled {
@@ -2457,7 +3480,7 @@ private final class FanCtlSettingsViewController: NSViewController, NSToolbarDel
             }
             UserDefaults.standard.set(shouldEnable, forKey: FanCtlDefaults.launchAtLoginEnabledKey)
         } catch {
-            NSLog("mFanCtl failed to update launch at login: \(error.localizedDescription)")
+            NSLog("MenuBar FanControl failed to update launch at login: \(error.localizedDescription)")
             UserDefaults.standard.set(previousValue, forKey: FanCtlDefaults.launchAtLoginEnabledKey)
             sender.state = previousValue ? .on : .off
         }
@@ -2790,7 +3813,7 @@ final class FanCtlMenuBarModel: NSObject {
 
     private let refreshInterval: TimeInterval = 2
     private static let maximumStaleTemperatureAge: TimeInterval = 30
-    private static let userPresetsKey = "userFanPresets"
+    private static let userPresetsKey = FanCtlDefaults.userPresetsKey
     private static let absoluteUserRPMRange =
         FanCtlHelperConstants.minimumRPM...FanCtlHelperConstants.maximumEncodedRPM
     private var lastValidGPUTemperature: Int?
@@ -2999,7 +4022,7 @@ final class FanCtlMenuBarModel: NSObject {
                 }
                 setNotice(error.localizedDescription, source: .sensor)
                 if snapshot == nil {
-                    menuBarTitle = "mFanCtl -"
+                    menuBarTitle = "\(FanCtlHelperConstants.appName) -"
                 }
             }
             self?.completeSensorRefresh()
@@ -3118,7 +4141,7 @@ final class FanCtlMenuBarModel: NSObject {
             }
             succeeded = true
         } catch {
-            NSLog("mFanCtl failed to restore automatic fan mode for \(reason): \(error.localizedDescription)")
+            NSLog("MenuBar FanControl failed to restore automatic fan mode for \(reason): \(error.localizedDescription)")
             if showsFailure, expectedGeneration == controlGeneration, !Task.isCancelled {
                 setNotice(error.localizedDescription, source: .control)
                 selectedPreset = nil
@@ -3411,7 +4434,7 @@ final class FanCtlMenuBarModel: NSObject {
                 if shouldPrompt {
                     didRequireHelperApproval?()
                 }
-                NSLog("mFanCtl fan helper requires approval")
+                NSLog("MenuBar FanControl fan helper requires approval")
             } catch {
                 guard generation == controlGeneration else {
                     return
@@ -3434,7 +4457,7 @@ final class FanCtlMenuBarModel: NSObject {
                 } else {
                     setNotice(error.localizedDescription, source: .control)
                 }
-                NSLog("mFanCtl failed to apply fan preset: \(error.localizedDescription)")
+                NSLog("MenuBar FanControl failed to apply fan preset: \(error.localizedDescription)")
             }
 
         }
@@ -3539,9 +4562,9 @@ final class FanCtlMenuBarModel: NSObject {
 
         try await Task.detached {
             if requiresReinstall {
-                try FanCtlHelperInstaller.reinstall()
+                try await FanCtlHelperInstaller.reinstall()
             } else {
-                try FanCtlHelperInstaller.install()
+                try await FanCtlHelperInstaller.install()
             }
         }.value
         FanCtlHelperClient.invalidateConnection()
@@ -3555,7 +4578,7 @@ final class FanCtlMenuBarModel: NSObject {
                 throw error
             }
             try await Task.detached {
-                try FanCtlHelperInstaller.reinstall()
+                try await FanCtlHelperInstaller.reinstall()
             }.value
             FanCtlHelperClient.invalidateConnection()
             try Task.checkCancellation()
@@ -3676,7 +4699,7 @@ final class FanCtlMenuBarModel: NSObject {
             }
             do {
                 try await Task.detached {
-                    try FanCtlHelperInstaller.install()
+                    try await FanCtlHelperInstaller.install()
                 }.value
                 FanCtlHelperClient.invalidateConnection()
                 try Task.checkCancellation()
@@ -3686,7 +4709,7 @@ final class FanCtlMenuBarModel: NSObject {
                     throw CancellationError()
                 } catch {
                     try await Task.detached {
-                        try FanCtlHelperInstaller.reinstall()
+                        try await FanCtlHelperInstaller.reinstall()
                     }.value
                     FanCtlHelperClient.invalidateConnection()
                     try Task.checkCancellation()
@@ -3714,12 +4737,12 @@ final class FanCtlMenuBarModel: NSObject {
                 requiresHelperApproval = true
                 setNotice(InstallError.requiresApproval.localizedDescription, source: .permission)
                 didRequireHelperApproval?()
-                NSLog("mFanCtl fan helper requires approval")
+                NSLog("MenuBar FanControl fan helper requires approval")
             } catch {
                 helperState = .unavailable
                 requiresHelperApproval = false
                 setNotice(error.localizedDescription, source: .helper)
-                NSLog("mFanCtl silent fan helper preparation failed: \(error.localizedDescription)")
+                NSLog("MenuBar FanControl silent fan helper preparation failed: \(error.localizedDescription)")
             }
             helperPreparationTask = nil
         }

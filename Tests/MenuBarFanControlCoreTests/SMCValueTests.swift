@@ -402,6 +402,31 @@ final class SMCValueTests: XCTestCase {
         XCTAssertTrue(status.isFullyAutomatic)
     }
 
+    func testEmptyFanSetIsNotReportedAsAutomatic() {
+        let status = FanAutomaticControlStatus(
+            fans: [],
+            forceTestMode: 0
+        )
+
+        XCTAssertFalse(status.isFullyAutomatic)
+    }
+
+    func testSetAutomaticRejectsEmptyFanSet() {
+        let smc = FakeSMCClient(values: [
+            "FNum": ui8("FNum", 0),
+            "Ftst": ui8("Ftst", 0)
+        ])
+
+        XCTAssertThrowsError(
+            try FanController(smc: smc, timing: .immediate).setAutomatic()
+        ) { error in
+            guard case FanControlError.invalidFanCount(let count) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(count, 0)
+        }
+    }
+
     func testUnknownModeIsNotReportedAsAutomatic() throws {
         let smc = FakeSMCClient(values: standardFanValues(mode: 2, forceTest: 0))
 

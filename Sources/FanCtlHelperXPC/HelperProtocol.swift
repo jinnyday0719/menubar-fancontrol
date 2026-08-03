@@ -1,13 +1,35 @@
 import Foundation
 
 public enum FanCtlHelperConstants {
-    public static let appName = "mFanCtl"
-    public static let appExecutableName = "mFanCtl"
-    public static let machServiceName = "io.github.jinnyday0719.mfanctl.FanControlHelper"
+    public static let appName = "MenuBar FanControl"
+    public static let appExecutableName = "MenuBarFanControl"
+    public static let releaseArtifactName = "MenuBar-FanControl"
+    public static let helperExecutableName = "MenuBarFanControlHelper"
+    public static let legacyCleanupAppName = "MenuBar FanControl Legacy Cleanup"
+    public static let legacyCleanupExecutableName = "MenuBarFanControlLegacyCleanup"
+
+    public static let appBundleIdentifier = "io.github.jinnyday0719.MenuBarFanControl"
+    public static let helperBundleIdentifier = "io.github.jinnyday0719.MenuBarFanControl.Helper"
+    public static let machServiceName = helperBundleIdentifier
     public static let daemonPlistName = "\(machServiceName).plist"
-    public static let helperExecutableName = "mFanCtlFanHelper"
-    public static let appBundleIdentifier = "io.github.jinnyday0719.mfanctl"
-    public static let protocolVersion = 3
+
+    // These identifiers are used only to find and remove installations made by
+    // releases from before the MenuBar FanControl identity migration.
+    public static let legacyAppBundleIdentifier = "io.github.jinnyday0719.mfanctl"
+    public static let legacyMachServiceName = "io.github.jinnyday0719.mfanctl.FanControlHelper"
+    public static let legacyDaemonPlistName = "\(legacyMachServiceName).plist"
+    public static let legacyManualHelperIdentifier = "io.github.jinnyday0719.mfanctl.helper"
+    public static let legacyManualHelperExecutablePath =
+        "/Library/PrivilegedHelperTools/\(legacyManualHelperIdentifier)"
+    public static let legacyManualHelperPlistPath =
+        "/Library/LaunchDaemons/\(legacyManualHelperIdentifier).plist"
+    public static let legacyManualHelperSocketPath =
+        "/var/run/\(legacyManualHelperIdentifier).sock"
+    public static let legacyManualHelperLogPath =
+        "/var/log/\(legacyManualHelperIdentifier).log"
+    public static let developerTeamIdentifier = "93BTXAM95W"
+
+    public static let protocolVersion = 4
     public static let minimumRPM = 1
     public static let maximumEncodedRPM = 16_383
     public static let manualControlLeaseDuration: TimeInterval = 15
@@ -25,7 +47,8 @@ public struct FanCtlHelperWireFailure: Equatable, Sendable {
 }
 
 public enum FanCtlHelperWire {
-    public static let failurePrefix = "MFANCTL_HELPER_ERROR"
+    public static let failurePrefix = "MENUBAR_FANCONTROL_HELPER_ERROR"
+    private static let legacyFailurePrefix = "MFANCTL_HELPER_ERROR"
 
     public static func encodeFailure(code: String, message: String) -> String {
         "\(failurePrefix)|\(code)|\(message)"
@@ -33,7 +56,9 @@ public enum FanCtlHelperWire {
 
     public static func decodeFailure(_ value: String) -> FanCtlHelperWireFailure? {
         let parts = value.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
-        guard parts.count == 3, parts[0] == Substring(failurePrefix) else {
+        guard parts.count == 3,
+              parts[0] == Substring(failurePrefix) ||
+                  parts[0] == Substring(legacyFailurePrefix) else {
             return nil
         }
 
@@ -41,7 +66,52 @@ public enum FanCtlHelperWire {
     }
 }
 
-@objc(MFanCtlHelperXPCProtocol)
+public enum FanCtlHelperRegistrationStatus: Sendable {
+    case enabled
+    case requiresApproval
+    case inactive
+}
+
+public enum FanCtlHelperRegistrationAction: Equatable, Sendable {
+    case none
+    case adoptPendingRegistration
+    case register
+    case replace
+    case awaitApproval
+}
+
+public enum FanCtlHelperRegistrationPlanner {
+    public static func action(
+        status: FanCtlHelperRegistrationStatus,
+        forceReinstall: Bool,
+        currentFingerprint: String,
+        registeredFingerprint: String?,
+        pendingFingerprint: String?
+    ) -> FanCtlHelperRegistrationAction {
+        switch status {
+        case .enabled:
+            if forceReinstall {
+                return .replace
+            }
+            if registeredFingerprint == currentFingerprint {
+                return .none
+            }
+            if pendingFingerprint == currentFingerprint {
+                return .adoptPendingRegistration
+            }
+            return .replace
+        case .requiresApproval:
+            return registeredFingerprint == currentFingerprint ||
+                pendingFingerprint == currentFingerprint
+                ? .awaitApproval
+                : .replace
+        case .inactive:
+            return .register
+        }
+    }
+}
+
+@objc(MenuBarFanControlHelperXPCProtocol)
 public protocol FanCtlHelperXPCProtocol {
     func ping(withReply reply: @escaping (NSString?, NSString?) -> Void)
     func getVersion(withReply reply: @escaping (NSNumber, NSString) -> Void)
@@ -49,4 +119,14 @@ public protocol FanCtlHelperXPCProtocol {
     func setAutomatic(_ sequence: NSNumber, withReply reply: @escaping (NSString?, NSString?) -> Void)
     func setMaximum(_ sequence: NSNumber, withReply reply: @escaping (NSString?, NSString?) -> Void)
     func setRPM(_ rpm: NSNumber, sequence: NSNumber, withReply reply: @escaping (NSString?, NSString?) -> Void)
+    func removeLegacyManualHelperInstall(
+        _ sequence: NSNumber,
+        withReply reply: @escaping (NSString?, NSString?) -> Void
+    )
+}
+
+@objc(MFanCtlHelperXPCProtocol)
+public protocol FanCtlLegacyUnsequencedHelperXPCProtocol {
+    func ping(withReply reply: @escaping (NSString?, NSString?) -> Void)
+    func setAutomatic(withReply reply: @escaping (NSString?, NSString?) -> Void)
 }

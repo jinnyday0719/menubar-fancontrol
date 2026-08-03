@@ -3,14 +3,18 @@
 import PackageDescription
 
 let package = Package(
-    name: "mFanCtl",
+    name: "MenuBarFanControl",
     platforms: [
         .macOS(.v14)
     ],
     products: [
         .library(name: "FanCtlCore", targets: ["FanCtlCore"]),
-        .executable(name: "mfanctl-menubar", targets: ["FanCtlMenuBar"]),
-        .executable(name: "mfanctl-helper", targets: ["FanCtlHelper"])
+        .executable(name: "menubar-fancontrol", targets: ["FanCtlMenuBar"]),
+        .executable(name: "menubar-fancontrol-helper", targets: ["FanCtlHelper"]),
+        .executable(
+            name: "menubar-fancontrol-legacy-cleanup",
+            targets: ["FanCtlLegacyCleanup"]
+        )
     ],
     targets: [
         .target(
@@ -28,6 +32,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("IOKit"),
+                .linkedFramework("Security"),
                 .linkedFramework("ServiceManagement")
             ]
         ),
@@ -38,13 +43,25 @@ let package = Package(
                 .linkedFramework("Security")
             ]
         ),
+        .executableTarget(
+            name: "FanCtlLegacyCleanup",
+            dependencies: ["FanCtlCore", "FanCtlHelperXPC"],
+            linkerSettings: [
+                .linkedFramework("ServiceManagement")
+            ]
+        ),
         .testTarget(
-            name: "mFanCtlCoreTests",
-            dependencies: ["FanCtlCore"]
+            name: "MenuBarFanControlCoreTests",
+            dependencies: ["FanCtlCore"],
+            path: "Tests/MenuBarFanControlCoreTests"
         ),
         .testTarget(
             name: "FanCtlHelperXPCTests",
             dependencies: ["FanCtlHelperXPC"]
+        ),
+        .testTarget(
+            name: "FanCtlMenuBarTests",
+            dependencies: ["FanCtlMenuBar"]
         )
     ]
 )

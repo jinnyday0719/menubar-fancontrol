@@ -1,9 +1,9 @@
-# mFanCtl
+# MenuBar FanControl
 
-<img src="thum.jpeg" alt="mFanCtl menu bar display" width="720">
+<img src="thum.jpeg" alt="MenuBar FanControl menu bar display" width="720">
 
-mFanCtl is a macOS menu bar fan control utility for Apple Silicon Macs with
-built-in fans. The temperature shown in the menu bar is based on GPU
+MenuBar FanControl is a macOS menu bar fan control utility for Apple Silicon
+Macs with built-in fans. The temperature shown in the menu bar is based on GPU
 temperature.
 
 ## Requirements
@@ -30,31 +30,53 @@ release.
 
 ## Installation
 
-Download the latest DMG from the Releases page, open it, and drag `mFanCtl.app`
-to Applications.
+Download the latest DMG from the Releases page, open it, and drag
+`MenuBar FanControl.app` to Applications.
 
-On first launch, mFanCtl prepares its privileged helper. macOS may ask you to
-allow mFanCtl in the Allow in the Background section under System Settings >
-General > Login Items (Login Items & Extensions on newer macOS releases).
-Reading the menu bar sensors does not require this privilege; changing fan mode
-or RPM requires the helper to be approved and running. If approval is denied or
-the helper cannot be used, the status text below the fan mode choices reports
-the problem and a mode choice is not considered applied.
+When upgrading from a version released before the rename, quit the previous
+menu bar app before opening the new app. On first launch, MenuBar FanControl
+copies the language, presets, display, update, and launch-at-login preferences;
+restores Automatic mode; unregisters the previous fan helper and login item;
+and only then offers to move the verified previous app bundle to the Trash.
+Do not manually delete the previous app if this migration reports an error.
 
-If update checks are enabled, mFanCtl contacts the GitHub Releases API at launch
-to compare the latest released version.
+The active application identifier is
+`io.github.jinnyday0719.MenuBarFanControl`. The helper executable, launch daemon,
+Mach service, and code-signing identifier use
+`io.github.jinnyday0719.MenuBarFanControl.Helper`. Because this is a new background
+service identity, macOS may ask for approval again during the upgrade. A
+signed migration-only cleanup component temporarily retains the previous
+identity so it can restore Automatic and remove the previous helper and login
+item during migration; it is not installed or run afterward.
+
+The migration also recognizes the socket-based root helper used by versions
+0.1 and 0.2. It verifies Automatic mode with the current controller, stops that
+legacy launch daemon, and removes only its fixed executable, plist, socket, and
+log paths before completing the rename.
+
+On first launch, MenuBar FanControl prepares its privileged helper. macOS may
+ask you to allow MenuBar FanControl in the Allow in the Background section
+under System Settings > General > Login Items (Login Items & Extensions on
+newer macOS releases). Reading the menu bar sensors does not require this
+privilege; changing fan mode or RPM requires the helper to be approved and
+running. If approval is denied or the helper cannot be used, the status text
+below the fan mode choices reports the problem and a mode choice is not
+considered applied.
+
+If update checks are enabled, MenuBar FanControl contacts the GitHub Releases
+API at launch to compare the latest released version.
 
 ## Fan modes and safety
 
-mFanCtl uses undocumented Apple SMC interfaces. Sensor availability and fan
-behavior may vary by Mac model and macOS version.
+MenuBar FanControl uses undocumented Apple SMC interfaces. Sensor availability
+and fan behavior may vary by Mac model and macOS version.
 
-The SMC raw fan-mode values currently handled by mFanCtl are `0` (firmware
-automatic), `1` (manual), and `3` (system-managed automatic). The Automatic UI
-choice accepts a verified `0` or `3`; it does not assume that all Macs use or
-return raw mode `3`. Unknown values and failed reads are treated as an error
-rather than as proof that the fan is automatic. These meanings are based on
-observed behavior, not a public Apple API contract.
+The SMC raw fan-mode values currently handled by MenuBar FanControl are `0`
+(firmware automatic), `1` (manual), and `3` (system-managed automatic). The
+Automatic UI choice accepts a verified `0` or `3`; it does not assume that all
+Macs use or return raw mode `3`. Unknown values and failed reads are treated as
+an error rather than as proof that the fan is automatic. These meanings are
+based on observed behavior, not a public Apple API contract.
 
 Manual and Maximum modes use a short safety lease. While one is active, the app
 renews the lease; if the app crashes, loses contact with the helper, or stops
@@ -75,11 +97,11 @@ Automatic mode or restart your Mac.
 ## Development packaging
 
 Run `scripts/package-menubar-app.sh` to build an unsigned development app at
-`.build/mFanCtl.app`. This artifact can test the UI and read-only sensors, but
-its privileged fan-control helper intentionally rejects an unsigned client.
-It must not be distributed as a release. Packaging generates `AppIcon.icns`
-from the tracked `Resources/AppIcon.png`, so a clean clone does not require a
-pre-generated icon file.
+`.build/MenuBar FanControl.app`. This artifact can test the UI and read-only
+sensors, but its privileged fan-control helper intentionally rejects an
+unsigned client. It must not be distributed as a release. Packaging generates
+`AppIcon.icns` from the tracked `Resources/AppIcon.png`, so a clean clone does
+not require a pre-generated icon file.
 
 ## Release packaging
 
@@ -103,7 +125,7 @@ have matching Developer ID teams and hardened-runtime signatures, and both the
 app and final DMG pass notarization, stapling, signature validation, and
 Gatekeeper assessment. The DMG and app resources both include the MIT license.
 Unstripped debug symbols are emitted separately under
-`dist/mFanCtl-VERSION-BUILD.dSYMs`; the signed app contains stripped
+`dist/MenuBar-FanControl-VERSION-BUILD.dSYMs`; the signed app contains stripped
 executables.
 
 ## License

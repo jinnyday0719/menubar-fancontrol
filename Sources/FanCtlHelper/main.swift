@@ -1,5 +1,6 @@
 import FanCtlCore
 import FanCtlHelperXPC
+import Darwin
 import Dispatch
 import Foundation
 import Security
@@ -12,7 +13,7 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
 
     private let mutationLock = NSLock()
     private let watchdogQueue = DispatchQueue(
-        label: "io.github.jinnyday0719.mfanctl.helper.manual-lease"
+        label: "\(FanCtlHelperConstants.machServiceName).manual-lease"
     )
     private var leaseWatchdog: DispatchSourceTimer?
     private var leaseWatchdogGeneration: UInt64 = 0
@@ -88,6 +89,27 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
             let value = try validatedRPM(rpm)
             try setRPM(Double(value))
             return "rpm \(value)"
+        }
+    }
+
+    func removeLegacyManualHelperInstall(
+        _ sequence: NSNumber,
+        withReply reply: @escaping (NSString?, NSString?) -> Void
+    ) {
+        completeMutation(sequence: sequence, reply) {
+            do {
+                guard LegacyManualHelperInstall.isPresent else {
+                    return "legacy helper absent"
+                }
+                try setAutomatic()
+                try LegacyManualHelperInstall.remove {
+                    try setAutomatic()
+                }
+                return "legacy helper removed"
+            } catch {
+                scheduleAutomaticRecoveryAfterFailedAttempt()
+                throw error
+            }
         }
     }
 
@@ -273,7 +295,7 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
             automaticRecoveryAttempts = 0
             nextAutomaticRecoveryAttempt = now
             logMessages.append(
-                "mFanCtl helper: manual-control lease expired; restoring automatic fan control."
+                "MenuBar FanControl helper: manual-control lease expired; restoring automatic fan control."
             )
         }
 
@@ -283,7 +305,7 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
             do {
                 try setAutomatic()
                 logMessages.append(
-                    "mFanCtl helper: automatic fan-control recovery succeeded on attempt \(attempt)."
+                    "MenuBar FanControl helper: automatic fan-control recovery succeeded on attempt \(attempt)."
                 )
             } catch {
                 automaticRecoveryAttempts = attempt
@@ -291,7 +313,7 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
                 if attempt < Self.fastAutomaticRecoveryAttempts {
                     retryInterval = Self.fastAutomaticRecoveryRetryInterval
                     logMessages.append(
-                        "mFanCtl helper: automatic fan-control recovery attempt \(attempt)/\(Self.fastAutomaticRecoveryAttempts) failed: \(error.localizedDescription)"
+                        "MenuBar FanControl helper: automatic fan-control recovery attempt \(attempt)/\(Self.fastAutomaticRecoveryAttempts) failed: \(error.localizedDescription)"
                     )
                 } else {
                     retryInterval = Self.slowAutomaticRecoveryRetryInterval
@@ -299,7 +321,7 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
                         ? "fast recovery exhausted; switching to periodic recovery"
                         : "periodic recovery attempt \(attempt) failed"
                     logMessages.append(
-                        "mFanCtl helper: \(phase): \(error.localizedDescription)"
+                        "MenuBar FanControl helper: \(phase): \(error.localizedDescription)"
                     )
                 }
                 automaticRecoveryPending = true
@@ -644,6 +666,238 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
     }
 }
 
+private enum LegacyManualHelperInstall {
+    private static let launchctlTimeout: TimeInterval = 10
+    private static let launchctlTerminationGracePeriod: TimeInterval = 2
+
+    private enum LaunchDaemonState {
+        case loaded
+        case notLoaded
+        case queryFailed(String)
+    }
+
+    static var isPresent: Bool {
+        let filesArePresent = [
+            FanCtlHelperConstants.legacyManualHelperExecutablePath,
+            FanCtlHelperConstants.legacyManualHelperPlistPath,
+            FanCtlHelperConstants.legacyManualHelperSocketPath,
+            FanCtlHelperConstants.legacyManualHelperLogPath
+        ].contains(where: pathExistsWithoutFollowingSymlinks)
+        if filesArePresent {
+            return true
+        }
+        switch launchDaemonState() {
+        case .loaded, .queryFailed:
+            return true
+        case .notLoaded:
+            return false
+        }
+    }
+
+    static func remove(
+        verifyAutomaticAfterBootout: () throws -> Void
+    ) throws {
+        try validateInstalledFiles()
+
+        switch launchDaemonState() {
+        case .loaded:
+            let result = runLaunchctl([
+                "bootout",
+                "system/\(FanCtlHelperConstants.legacyManualHelperIdentifier)"
+            ])
+            guard result.status == 0 else {
+                throw FanCtlHelperError.legacyManualHelperCleanupFailed(
+                    result.errorMessage
+                )
+            }
+        case .notLoaded:
+            break
+        case .queryFailed(let detail):
+            throw FanCtlHelperError.legacyManualHelperCleanupFailed(
+                "could not determine whether the legacy launch daemon is loaded: \(detail)"
+            )
+        }
+
+        switch launchDaemonState() {
+        case .notLoaded:
+            break
+        case .loaded:
+            throw FanCtlHelperError.legacyManualHelperCleanupFailed(
+                "the legacy launch daemon is still loaded"
+            )
+        case .queryFailed(let detail):
+            throw FanCtlHelperError.legacyManualHelperCleanupFailed(
+                "could not verify that the legacy launch daemon stopped: \(detail)"
+            )
+        }
+
+        // A request already accepted by the old helper could race the first
+        // verification. Reassert and verify Automatic only after launchd has
+        // stopped the old process.
+        try verifyAutomaticAfterBootout()
+
+        for path in [
+            FanCtlHelperConstants.legacyManualHelperSocketPath,
+            FanCtlHelperConstants.legacyManualHelperPlistPath,
+            FanCtlHelperConstants.legacyManualHelperExecutablePath,
+            FanCtlHelperConstants.legacyManualHelperLogPath
+        ] where pathExistsWithoutFollowingSymlinks(path) {
+            if unlink(path) != 0, errno != ENOENT {
+                throw FanCtlHelperError.legacyManualHelperCleanupFailed(
+                    "could not remove \(path): " +
+                        String(cString: strerror(errno))
+                )
+            }
+        }
+
+        guard !isPresent else {
+            throw FanCtlHelperError.legacyManualHelperCleanupFailed(
+                "legacy helper files are still present"
+            )
+        }
+    }
+
+    private static func validateInstalledFiles() throws {
+        let executablePath =
+            FanCtlHelperConstants.legacyManualHelperExecutablePath
+        if pathExistsWithoutFollowingSymlinks(executablePath) {
+            guard isRootOwnedRegularFile(executablePath),
+                  hasExpectedSignature(executablePath) else {
+                throw FanCtlHelperError.invalidLegacyManualHelperInstall(
+                    "the installed helper executable has an unexpected identity"
+                )
+            }
+        }
+
+        let plistPath = FanCtlHelperConstants.legacyManualHelperPlistPath
+        if pathExistsWithoutFollowingSymlinks(plistPath) {
+            guard isRootOwnedRegularFile(plistPath),
+                  let data = FileManager.default.contents(atPath: plistPath),
+                  let plist = try? PropertyListSerialization.propertyList(
+                      from: data,
+                      options: [],
+                      format: nil
+                  ) as? [String: Any],
+                  plist["Label"] as? String ==
+                    FanCtlHelperConstants.legacyManualHelperIdentifier,
+                  let arguments = plist["ProgramArguments"] as? [String],
+                  arguments == [executablePath] else {
+                throw FanCtlHelperError.invalidLegacyManualHelperInstall(
+                    "the installed launch daemon plist is not a known MenuBar FanControl predecessor"
+                )
+            }
+        }
+    }
+
+    private static func isRootOwnedRegularFile(_ path: String) -> Bool {
+        var information = stat()
+        guard lstat(path, &information) == 0 else {
+            return false
+        }
+        return information.st_uid == 0 &&
+            (information.st_mode & S_IFMT) == S_IFREG
+    }
+
+    private static func pathExistsWithoutFollowingSymlinks(
+        _ path: String
+    ) -> Bool {
+        var information = stat()
+        return lstat(path, &information) == 0
+    }
+
+    private static func hasExpectedSignature(_ path: String) -> Bool {
+        var staticCode: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(
+            URL(fileURLWithPath: path) as CFURL,
+            SecCSFlags(),
+            &staticCode
+        ) == errSecSuccess,
+        let staticCode,
+        SecStaticCodeCheckValidity(
+            staticCode,
+            SecCSFlags(),
+            nil
+        ) == errSecSuccess else {
+            return false
+        }
+
+        var information: CFDictionary?
+        let flags = SecCSFlags(rawValue: kSecCSSigningInformation)
+        guard SecCodeCopySigningInformation(
+            staticCode,
+            flags,
+            &information
+        ) == errSecSuccess,
+        let dictionary = information as? [String: Any],
+        dictionary[kSecCodeInfoIdentifier as String] as? String ==
+            FanCtlHelperConstants.legacyManualHelperIdentifier,
+        dictionary[kSecCodeInfoTeamIdentifier as String] as? String ==
+            FanCtlHelperConstants.developerTeamIdentifier else {
+            return false
+        }
+        return true
+    }
+
+    private static func launchDaemonState() -> LaunchDaemonState {
+        let result = runLaunchctl([
+            "print",
+            "system/\(FanCtlHelperConstants.legacyManualHelperIdentifier)"
+        ])
+        if result.status == 0 {
+            return .loaded
+        }
+        if result.status == 113 &&
+            result.errorMessage.localizedCaseInsensitiveContains(
+                "could not find service"
+            ) {
+            return .notLoaded
+        }
+        return .queryFailed(result.errorMessage)
+    }
+
+    private static func runLaunchctl(
+        _ arguments: [String]
+    ) -> (status: Int32, errorMessage: String) {
+        let process = Process()
+        let errorPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = errorPipe
+
+        let termination = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            termination.signal()
+        }
+        do {
+            try process.run()
+        } catch {
+            return (-1, error.localizedDescription)
+        }
+
+        guard termination.wait(
+            timeout: .now() + launchctlTimeout
+        ) == .success else {
+            process.terminate()
+            _ = termination.wait(
+                timeout: .now() + launchctlTerminationGracePeriod
+            )
+            process.terminationHandler = nil
+            return (-1, "launchctl timed out")
+        }
+        process.terminationHandler = nil
+
+        let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        let detail = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (
+            process.terminationStatus,
+            detail.flatMap { $0.isEmpty ? nil : $0 } ??
+                "launchctl exited with status \(process.terminationStatus)"
+        )
+    }
+}
+
 private struct ControllableFan {
     let index: Int
     let modeKey: String
@@ -767,6 +1021,8 @@ private enum FanCtlHelperError: LocalizedError {
     case fanOperationFailed(operation: String, fanIndex: Int, detail: String)
     case incompleteOperation(operation: String, failures: [String])
     case automaticRecoveryFailed(primary: String, failures: [String])
+    case invalidLegacyManualHelperInstall(String)
+    case legacyManualHelperCleanupFailed(String)
 
     var wireCode: String {
         switch self {
@@ -786,6 +1042,9 @@ private enum FanCtlHelperError: LocalizedError {
             "fan_control_failed"
         case .automaticRecoveryFailed:
             "automatic_recovery_failed"
+        case .invalidLegacyManualHelperInstall,
+             .legacyManualHelperCleanupFailed:
+            "legacy_cleanup_failed"
         }
     }
 
@@ -819,6 +1078,10 @@ private enum FanCtlHelperError: LocalizedError {
             "Could not complete \(operation) for every fan: \(failures.joined(separator: "; "))."
         case .automaticRecoveryFailed(let primary, let failures):
             "\(primary) Automatic recovery also failed: \(failures.joined(separator: "; "))."
+        case .invalidLegacyManualHelperInstall(let detail):
+            "The previous helper installation could not be verified: \(detail)."
+        case .legacyManualHelperCleanupFailed(let detail):
+            "The previous helper installation could not be removed: \(detail)."
         }
     }
 }

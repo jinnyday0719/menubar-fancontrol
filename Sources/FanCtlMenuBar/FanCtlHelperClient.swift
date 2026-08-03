@@ -1,6 +1,8 @@
 import FanCtlHelperXPC
+import CryptoKit
 import Dispatch
 import Foundation
+import Security
 import ServiceManagement
 
 enum FanCtlHelperClient {
@@ -202,6 +204,14 @@ enum FanCtlHelperClient {
                             throw Error.invalidResponse
                         }
                         proxy.renewManualControlLease(sequenceNumber, withReply: reply)
+                    case "REMOVE_LEGACY_MANUAL_HELPER":
+                        guard let sequenceNumber else {
+                            throw Error.invalidResponse
+                        }
+                        proxy.removeLegacyManualHelperInstall(
+                            sequenceNumber,
+                            withReply: reply
+                        )
                     default:
                         if command.hasPrefix("SET_RPM ") {
                             let rawRPM = String(command.dropFirst("SET_RPM ".count))
@@ -238,6 +248,7 @@ enum FanCtlHelperClient {
         command == "SET_AUTOMATIC" ||
             command == "SET_MAXIMUM" ||
             command == "RENEW_MANUAL_LEASE" ||
+            command == "REMOVE_LEGACY_MANUAL_HELPER" ||
             command.hasPrefix("SET_RPM ")
     }
 }
@@ -429,8 +440,10 @@ private final class XPCReplyState: @unchecked Sendable {
 }
 
 enum FanCtlHelperInstaller {
-    private static let registeredHelperBuildKey = "registeredFanControlHelperBuild"
-    private static let pendingHelperBuildKey = "pendingFanControlHelperBuild"
+    private static let registeredHelperFingerprintKey = "registeredFanControlHelperFingerprint"
+    private static let pendingHelperFingerprintKey = "pendingFanControlHelperFingerprint"
+    private static let legacyRegisteredHelperBuildKey = "registeredFanControlHelperBuild"
+    private static let legacyPendingHelperBuildKey = "pendingFanControlHelperBuild"
 
     static var serviceStatus: FanCtlHelperServiceStatus {
         let service = SMAppService.daemon(plistName: FanCtlHelperConstants.daemonPlistName)
@@ -446,106 +459,223 @@ enum FanCtlHelperInstaller {
         }
     }
 
-    static func install() throws {
-        let service = SMAppService.daemon(plistName: FanCtlHelperConstants.daemonPlistName)
-        switch service.status {
-        case .enabled:
-            try refreshEnabledServiceIfNeeded(service)
-        case .requiresApproval:
-            throw InstallError.requiresApproval
-        case .notRegistered, .notFound:
-            try register(service)
-        @unknown default:
-            try register(service)
+    static func install() async throws {
+        try validateContainingApplication()
+        try await reconcileRegistration(forceReinstall: false)
+    }
+
+    static func reinstall() async throws {
+        try validateContainingApplication()
+        try await reconcileRegistration(forceReinstall: true)
+    }
+
+    private static func validateContainingApplication() throws {
+        guard isTrustedContainingApplication else {
+            throw InstallError.untrustedApplication
+        }
+        guard isInstalledApplication else {
+            throw InstallError.unstableApplicationLocation
+        }
+        guard currentFingerprint != nil else {
+            throw InstallError.invalidBundledHelper
         }
     }
 
-    static func reinstall() throws {
+    private static func reconcileRegistration(forceReinstall: Bool) async throws {
+        guard let currentFingerprint else {
+            throw InstallError.invalidBundledHelper
+        }
         let service = SMAppService.daemon(plistName: FanCtlHelperConstants.daemonPlistName)
-        switch service.status {
-        case .enabled:
-            try service.unregister()
-        case .requiresApproval:
-            throw InstallError.requiresApproval
-        case .notRegistered, .notFound:
-            break
-        @unknown default:
-            break
-        }
+        let registeredFingerprint = UserDefaults.standard.string(
+            forKey: registeredHelperFingerprintKey
+        )
+        let pendingFingerprint = UserDefaults.standard.string(
+            forKey: pendingHelperFingerprintKey
+        )
 
-        UserDefaults.standard.removeObject(forKey: registeredHelperBuildKey)
-        clearPendingBuild()
-        try register(service)
-    }
+        let action = FanCtlHelperRegistrationPlanner.action(
+            status: registrationStatus(for: service),
+            forceReinstall: forceReinstall,
+            currentFingerprint: currentFingerprint,
+            registeredFingerprint: registeredFingerprint,
+            pendingFingerprint: pendingFingerprint
+        )
 
-    private static func refreshEnabledServiceIfNeeded(_ service: SMAppService) throws {
-        guard let currentBuild = currentBuildNumber else {
-            return
-        }
-
-        let registeredBuild = UserDefaults.standard.string(forKey: registeredHelperBuildKey)
-        let pendingBuild = UserDefaults.standard.string(forKey: pendingHelperBuildKey)
-
-        if registeredBuild == currentBuild {
-            clearPendingBuild()
-            return
-        }
-
-        if pendingBuild == currentBuild {
+        switch action {
+        case .none:
+            clearPendingFingerprint()
+        case .adoptPendingRegistration:
             // A previous refresh reached the approval step. An enabled service now
             // means macOS completed that registration.
-            rememberRegisteredBuild(currentBuild)
-            clearPendingBuild()
-            return
+            rememberRegisteredFingerprint(currentFingerprint)
+            clearPendingFingerprint()
+        case .register:
+            clearStoredRegistration()
+            try register(service)
+        case .replace:
+            try await unregister(service)
+            clearStoredRegistration()
+            try register(service)
+        case .awaitApproval:
+            throw InstallError.requiresApproval
         }
+    }
 
-        try service.unregister()
-        rememberPendingBuild(currentBuild)
-        try register(service)
+    private static func registrationStatus(
+        for service: SMAppService
+    ) -> FanCtlHelperRegistrationStatus {
+        switch service.status {
+        case .enabled:
+            .enabled
+        case .requiresApproval:
+            .requiresApproval
+        case .notRegistered, .notFound:
+            .inactive
+        @unknown default:
+            .inactive
+        }
+    }
+
+    private static func unregister(_ service: SMAppService) async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Swift.Error>) in
+            service.unregister { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
     }
 
     private static func register(_ service: SMAppService) throws {
-        try service.register()
+        guard let currentFingerprint else {
+            throw InstallError.invalidBundledHelper
+        }
+        do {
+            try service.register()
+        } catch {
+            if service.status == .requiresApproval {
+                rememberPendingFingerprint(currentFingerprint)
+                throw InstallError.requiresApproval
+            }
+            throw error
+        }
 
         switch service.status {
         case .enabled:
-            if let currentBuild = currentBuildNumber {
-                rememberRegisteredBuild(currentBuild)
-                clearPendingBuild()
-            }
+            rememberRegisteredFingerprint(currentFingerprint)
+            clearPendingFingerprint()
         case .requiresApproval:
-            if let currentBuild = currentBuildNumber {
-                rememberPendingBuild(currentBuild)
-            }
+            rememberPendingFingerprint(currentFingerprint)
             throw InstallError.requiresApproval
         case .notRegistered, .notFound:
             throw InstallError.registrationDidNotStart
         @unknown default:
-            guard let currentBuild = currentBuildNumber else {
-                return
-            }
-            rememberRegisteredBuild(currentBuild)
+            rememberRegisteredFingerprint(currentFingerprint)
         }
     }
 
-    private static var currentBuildNumber: String? {
+    private static let currentFingerprint: String? = {
         guard let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
               !build.isEmpty else {
             return nil
         }
-        return build
+        let helperURL = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Library/LaunchServices", isDirectory: true)
+            .appendingPathComponent(FanCtlHelperConstants.helperExecutableName)
+        let daemonPlistURL = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Library/LaunchDaemons", isDirectory: true)
+            .appendingPathComponent(FanCtlHelperConstants.daemonPlistName)
+        guard let helperData = try? Data(contentsOf: helperURL, options: .mappedIfSafe),
+              let daemonPlistData = try? Data(
+                  contentsOf: daemonPlistURL,
+                  options: .mappedIfSafe
+              ) else {
+            return nil
+        }
+        let helperDigest = SHA256.hash(data: helperData)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let daemonPlistDigest = SHA256.hash(data: daemonPlistData)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let bundlePath = Bundle.main.bundleURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
+        return [
+            build,
+            String(FanCtlHelperConstants.protocolVersion),
+            FanCtlHelperConstants.helperExecutableName,
+            helperDigest,
+            daemonPlistDigest,
+            bundlePath
+        ].joined(separator: ":")
+    }()
+
+    private static var isTrustedContainingApplication: Bool {
+        guard Bundle.main.bundleIdentifier ==
+                FanCtlHelperConstants.appBundleIdentifier,
+              Bundle.main.object(
+                  forInfoDictionaryKey: "FanControlDistributionBuild"
+              ) as? Bool == true else {
+            return false
+        }
+
+        var code: SecCode?
+        guard SecCodeCopySelf(SecCSFlags(), &code) == errSecSuccess,
+              let code else {
+            return false
+        }
+
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, SecCSFlags(), &staticCode) == errSecSuccess,
+              let staticCode,
+              SecStaticCodeCheckValidity(
+                  staticCode,
+                  SecCSFlags(),
+                  nil
+              ) == errSecSuccess else {
+            return false
+        }
+
+        var information: CFDictionary?
+        let flags = SecCSFlags(rawValue: kSecCSSigningInformation)
+        guard SecCodeCopySigningInformation(staticCode, flags, &information) == errSecSuccess,
+              let dictionary = information as? [String: Any],
+              let teamIdentifier = dictionary[kSecCodeInfoTeamIdentifier as String] as? String,
+              teamIdentifier == FanCtlHelperConstants.developerTeamIdentifier else {
+            return false
+        }
+        return true
     }
 
-    private static func rememberRegisteredBuild(_ build: String) {
-        UserDefaults.standard.set(build, forKey: registeredHelperBuildKey)
+    private static var isInstalledApplication: Bool {
+        FanCtlApplicationLocation.isInstalledApplication()
     }
 
-    private static func rememberPendingBuild(_ build: String) {
-        UserDefaults.standard.set(build, forKey: pendingHelperBuildKey)
+    private static func rememberRegisteredFingerprint(_ fingerprint: String) {
+        UserDefaults.standard.set(fingerprint, forKey: registeredHelperFingerprintKey)
+        UserDefaults.standard.removeObject(forKey: legacyRegisteredHelperBuildKey)
     }
 
-    private static func clearPendingBuild() {
-        UserDefaults.standard.removeObject(forKey: pendingHelperBuildKey)
+    private static func rememberPendingFingerprint(_ fingerprint: String) {
+        UserDefaults.standard.set(fingerprint, forKey: pendingHelperFingerprintKey)
+        UserDefaults.standard.removeObject(forKey: legacyPendingHelperBuildKey)
+    }
+
+    private static func clearPendingFingerprint() {
+        UserDefaults.standard.removeObject(forKey: pendingHelperFingerprintKey)
+        UserDefaults.standard.removeObject(forKey: legacyPendingHelperBuildKey)
+    }
+
+    private static func clearStoredRegistration() {
+        UserDefaults.standard.removeObject(forKey: registeredHelperFingerprintKey)
+        UserDefaults.standard.removeObject(forKey: pendingHelperFingerprintKey)
+        UserDefaults.standard.removeObject(forKey: legacyRegisteredHelperBuildKey)
+        UserDefaults.standard.removeObject(forKey: legacyPendingHelperBuildKey)
     }
 }
 
@@ -558,6 +688,9 @@ enum FanCtlHelperServiceStatus {
 enum InstallError: LocalizedError {
     case requiresApproval
     case registrationDidNotStart
+    case untrustedApplication
+    case unstableApplicationLocation
+    case invalidBundledHelper
 
     var errorDescription: String? {
         switch self {
@@ -565,6 +698,12 @@ enum InstallError: LocalizedError {
             L10n.helperRequiresApproval
         case .registrationDidNotStart:
             L10n.helperRegistrationFailed
+        case .untrustedApplication:
+            L10n.signedReleaseRequired
+        case .unstableApplicationLocation:
+            L10n.installInApplicationsRequired
+        case .invalidBundledHelper:
+            L10n.invalidBundledHelper
         }
     }
 }
