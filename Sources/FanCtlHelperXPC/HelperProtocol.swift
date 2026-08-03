@@ -80,6 +80,74 @@ public enum FanCtlHelperRegistrationAction: Equatable, Sendable {
     case awaitApproval
 }
 
+public enum FanCtlMutationKind: Hashable, Sendable {
+    case manualControl
+    case automaticControl
+    case leaseRenewal
+    case maintenance
+}
+
+/// Tracks only the newest queued mutation in each independent command domain.
+/// Manual and Automatic are ordered together so the latest user choice wins;
+/// lease heartbeats never supersede a fan-control request.
+public final class FanCtlMutationSupersessionTracker: @unchecked Sendable {
+    private enum Domain: Hashable {
+        case fanControl
+        case lease
+        case maintenance
+    }
+
+    private let lock = NSLock()
+    private var latestSubmittedSequences: [Domain: Int64] = [:]
+    private var latestClaimedSequences: [Domain: Int64] = [:]
+
+    public init() {}
+
+    public func submit(_ sequence: Int64, kind: FanCtlMutationKind) {
+        lock.withLock {
+            let domain = domain(for: kind)
+            latestSubmittedSequences[domain] = max(
+                latestSubmittedSequences[domain] ?? .min,
+                sequence
+            )
+        }
+    }
+
+    public func latestSequence(for kind: FanCtlMutationKind) -> Int64 {
+        lock.withLock { latestSubmittedSequences[domain(for: kind)] ?? .min }
+    }
+
+    public func isSuperseded(_ sequence: Int64, kind: FanCtlMutationKind) -> Bool {
+        lock.withLock { (latestSubmittedSequences[domain(for: kind)] ?? .min) > sequence }
+    }
+
+    /// Atomically admits only the newest unexecuted command in a domain.
+    /// Manual and Automatic share one ordering domain, while heartbeats and
+    /// maintenance cannot invalidate a user control request.
+    public func claimForExecution(_ sequence: Int64, kind: FanCtlMutationKind) -> Bool {
+        lock.withLock {
+            let domain = domain(for: kind)
+            guard sequence >= (latestSubmittedSequences[domain] ?? .min),
+                  sequence > (latestClaimedSequences[domain] ?? .min) else {
+                return false
+            }
+            latestClaimedSequences[domain] = sequence
+            return true
+        }
+    }
+
+    private func domain(for kind: FanCtlMutationKind) -> Domain {
+        switch kind {
+        case .manualControl, .automaticControl:
+            .fanControl
+        case .leaseRenewal:
+            .lease
+        case .maintenance:
+            .maintenance
+        }
+    }
+}
+
 public enum FanCtlHelperRegistrationPlanner {
     public static func action(
         status: FanCtlHelperRegistrationStatus,

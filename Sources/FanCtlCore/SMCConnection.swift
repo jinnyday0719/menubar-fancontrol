@@ -83,6 +83,13 @@ public protocol SMCClient: Sendable {
     func read(_ key: String) throws -> SMCValue
     func numericValue(for key: String) -> Double?
     func write(_ key: String, bytes: [UInt8]) throws
+    func write(_ key: String, bytes: [UInt8], expectedDataSize: UInt32) throws
+}
+
+public extension SMCClient {
+    func write(_ key: String, bytes: [UInt8], expectedDataSize: UInt32) throws {
+        try write(key, bytes: bytes)
+    }
 }
 
 private typealias SMCBytes = (
@@ -287,11 +294,26 @@ public final class SMCConnection: SMCClient, @unchecked Sendable {
         callLock.lock()
         defer { callLock.unlock() }
 
-        let keyCode = try validatedKeyCode(key)
         // Preserve the pre-write read check: writes are rare and safety-sensitive.
         // The read still benefits from cached key metadata after its first access.
         let existing = try read(key)
-        let expectedSize = Int(existing.dataSize)
+        try write(key, bytes: bytes, expectedDataSize: existing.dataSize)
+    }
+
+    public func write(_ key: String, bytes: [UInt8], expectedDataSize: UInt32) throws {
+        callLock.lock()
+        defer { callLock.unlock() }
+
+        let keyCode = try validatedKeyCode(key)
+        let metadata = try metadata(for: key, keyCode: keyCode)
+        guard metadata.dataSize == expectedDataSize else {
+            throw SMCError.invalidDataSize(
+                key: key,
+                expected: "exactly \(metadata.dataSize) bytes",
+                actual: Int(expectedDataSize)
+            )
+        }
+        let expectedSize = Int(metadata.dataSize)
         guard (1...32).contains(expectedSize) else {
             throw SMCError.invalidDataSize(
                 key: key,
@@ -310,7 +332,7 @@ public final class SMCConnection: SMCClient, @unchecked Sendable {
         var input = SMCKeyData()
         var output = SMCKeyData()
         input.key = keyCode
-        input.keyInfo.dataSize = existing.dataSize
+        input.keyInfo.dataSize = metadata.dataSize
         input.data8 = SMCCommand.writeBytes.rawValue
         input.bytes = bytesTuple(bytes)
 

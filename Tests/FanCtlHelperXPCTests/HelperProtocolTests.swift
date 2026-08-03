@@ -2,6 +2,54 @@ import XCTest
 @testable import FanCtlHelperXPC
 
 final class HelperProtocolTests: XCTestCase {
+    func testMutationTrackerCoalescesManualCommandsWithoutLeaseInterference() {
+        let tracker = FanCtlMutationSupersessionTracker()
+        tracker.submit(10, kind: .manualControl)
+        tracker.submit(11, kind: .leaseRenewal)
+        tracker.submit(12, kind: .manualControl)
+
+        XCTAssertTrue(tracker.isSuperseded(10, kind: .manualControl))
+        XCTAssertFalse(tracker.isSuperseded(12, kind: .manualControl))
+        XCTAssertFalse(tracker.isSuperseded(11, kind: .leaseRenewal))
+    }
+
+    func testMutationTrackerLetsAutomaticSupersedeOlderManualCommand() {
+        let tracker = FanCtlMutationSupersessionTracker()
+        tracker.submit(20, kind: .manualControl)
+        tracker.submit(21, kind: .automaticControl)
+
+        XCTAssertTrue(tracker.isSuperseded(20, kind: .manualControl))
+        XCTAssertFalse(tracker.isSuperseded(21, kind: .automaticControl))
+    }
+
+    func testMutationTrackerDoesNotDiscardManualSubmittedAfterAutomatic() {
+        let tracker = FanCtlMutationSupersessionTracker()
+        tracker.submit(30, kind: .automaticControl)
+        tracker.submit(31, kind: .manualControl)
+
+        XCTAssertFalse(tracker.isSuperseded(31, kind: .manualControl))
+        XCTAssertTrue(tracker.isSuperseded(30, kind: .automaticControl))
+    }
+
+    func testMutationTrackerClaimsControlAndLeaseInIndependentDomains() {
+        let tracker = FanCtlMutationSupersessionTracker()
+        tracker.submit(40, kind: .manualControl)
+        tracker.submit(41, kind: .leaseRenewal)
+
+        XCTAssertTrue(tracker.claimForExecution(41, kind: .leaseRenewal))
+        XCTAssertTrue(tracker.claimForExecution(40, kind: .manualControl))
+        XCTAssertFalse(tracker.claimForExecution(40, kind: .manualControl))
+    }
+
+    func testMutationTrackerRejectsOlderControlEvenWhenItArrivesFirstInQueue() {
+        let tracker = FanCtlMutationSupersessionTracker()
+        tracker.submit(50, kind: .automaticControl)
+        tracker.submit(51, kind: .manualControl)
+
+        XCTAssertFalse(tracker.claimForExecution(50, kind: .automaticControl))
+        XCTAssertTrue(tracker.claimForExecution(51, kind: .manualControl))
+    }
+
     func testWireFailureRoundTripPreservesDetailedMessage() {
         let encoded = FanCtlHelperWire.encodeFailure(
             code: "fan_control_failed",

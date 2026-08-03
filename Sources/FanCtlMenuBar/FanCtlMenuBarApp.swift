@@ -257,12 +257,6 @@ enum L10n {
     static var presetBaseName: String { text("사전 설정", "Preset") }
     static var maximum: String { text("최대", "Max") }
     static var installingPermission: String { text("팬 제어 준비 중...", "Preparing fan control...") }
-    static var applyingFanPreset: String {
-        text(
-            "팬 모드 전환 중...",
-            "Switching fan mode..."
-        )
-    }
     static var fanPresetFailedAndRestoredAutomatic: String {
         text(
             "팬 설정을 적용하지 못해 자동 모드로 되돌렸습니다.",
@@ -1852,8 +1846,8 @@ final class FanCtlAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, 
             for preset in model.presetEntries {
                 let item = presetMenuItems[preset.preset]
                 item?.title = preset.name
-                item?.state = model.selectedPreset == preset.preset ? .on : .off
-                item?.isEnabled = !model.presetsDisabled
+                item?.state = model.checkedPreset == preset.preset ? .on : .off
+                item?.isEnabled = model.isPresetEnabled(preset.preset)
             }
         }
 
@@ -3717,6 +3711,12 @@ private actor SensorSampler {
 
 @MainActor
 final class FanCtlMenuBarModel: NSObject {
+    enum PendingPresetRequestDisposition: Equatable {
+        case start
+        case deferLatest
+        case ignore
+    }
+
     static let defaultMenuBarTitleFormat = "{RPM}rpm | {TEMP}℃"
 
     struct Change: OptionSet, Sendable {
@@ -3831,11 +3831,13 @@ final class FanCtlMenuBarModel: NSObject {
     private var manualLeaseTimer: Timer?
     private var manualControlActivity: (any NSObjectProtocol)?
     private var controlGeneration = 0
+    private var deferredPreset: FanPreset?
     private var pendingPreset: FanPreset? {
         didSet {
             guard oldValue != pendingPreset else {
                 return
             }
+            notifyChange(.presets)
             didChangeLidMonitoringRequirement?()
         }
     }
@@ -3898,8 +3900,40 @@ final class FanCtlMenuBarModel: NSObject {
         }
     }
 
-    var presetsDisabled: Bool {
-        helperState == .installing
+    func isPresetEnabled(_ preset: FanPreset) -> Bool {
+        Self.isPresetEnabled(
+            preset,
+            pendingPreset: pendingPreset,
+            helperIsInstalling: helperState == .installing
+        )
+    }
+
+    static func isPresetEnabled(
+        _ preset: FanPreset,
+        pendingPreset: FanPreset?,
+        helperIsInstalling: Bool
+    ) -> Bool {
+        guard !helperIsInstalling else {
+            return false
+        }
+        guard let pendingPreset else {
+            return true
+        }
+        return preset == .automatic && pendingPreset != .automatic
+    }
+
+    var checkedPreset: FanPreset? {
+        Self.checkedPreset(
+            selectedPreset: selectedPreset,
+            pendingPreset: pendingPreset
+        )
+    }
+
+    static func checkedPreset(
+        selectedPreset: FanPreset?,
+        pendingPreset _: FanPreset?
+    ) -> FanPreset? {
+        selectedPreset
     }
 
     var validUserRPMRange: ClosedRange<Int> {
@@ -3969,6 +4003,7 @@ final class FanCtlMenuBarModel: NSObject {
         FanCtlHelperClient.invalidateConnection()
         controlTask?.cancel()
         controlTask = nil
+        deferredPreset = nil
         safetyRecoveryTask?.cancel()
         safetyRecoveryTask = nil
         stopManualControlMaintenance()
@@ -3987,7 +4022,9 @@ final class FanCtlMenuBarModel: NSObject {
     }
 
     func refresh() {
-        guard !isInvalidated, sensorRefreshTask == nil else {
+        guard !isInvalidated,
+              sensorRefreshTask == nil,
+              controlStateInvalidationTask == nil else {
             return
         }
 
@@ -4009,8 +4046,13 @@ final class FanCtlMenuBarModel: NSObject {
                     setNotice(L10n.noFansFound, source: .sensor)
                 } else {
                     setNotice(nil, source: .sensor)
-                    if canReconcileObservedState,
-                       observationGeneration == controlGeneration {
+                    if Self.shouldReconcileObservedState(
+                        beganEligible: canReconcileObservedState,
+                        observationGeneration: observationGeneration,
+                        currentControlGeneration: controlGeneration,
+                        controlStateRefreshPending: controlStateRefreshPending,
+                        hasInvalidationTask: controlStateInvalidationTask != nil
+                    ) {
                         reconcileObservedFanState(nextSnapshot)
                     }
                 }
@@ -4075,7 +4117,25 @@ final class FanCtlMenuBarModel: NSObject {
         refresh()
     }
 
+    static func shouldReconcileObservedState(
+        beganEligible: Bool,
+        observationGeneration: Int,
+        currentControlGeneration: Int,
+        controlStateRefreshPending: Bool,
+        hasInvalidationTask: Bool
+    ) -> Bool {
+        beganEligible &&
+            observationGeneration == currentControlGeneration &&
+            !controlStateRefreshPending &&
+            !hasInvalidationTask
+    }
+
     func applyPresetSelection(_ preset: FanPreset) {
+        if let pendingPreset {
+            guard preset == .automatic, pendingPreset != .automatic else {
+                return
+            }
+        }
         safetyRecoveryPending = false
         safetyRecoveryTask?.cancel()
         safetyRecoveryTask = nil
@@ -4096,6 +4156,7 @@ final class FanCtlMenuBarModel: NSObject {
 
     func restoreAutomaticForAppTermination() async {
         safetyRecoveryPending = false
+        deferredPreset = nil
         controlGeneration += 1
         pendingPreset = nil
         controlTask?.cancel()
@@ -4176,11 +4237,29 @@ final class FanCtlMenuBarModel: NSObject {
     }
 
     func deleteUserPreset(id: UUID) {
-        let wasSelectedOrPending = selectedPreset == .custom(id) || pendingPreset == .custom(id)
+        let deletedPreset = FanPreset.custom(id)
+        let wasSelected = selectedPreset == deletedPreset
+        let wasPending = pendingPreset == deletedPreset
+        if deferredPreset == deletedPreset {
+            deferredPreset = nil
+        }
         userPresets.removeAll { $0.id == id }
-        if wasSelectedOrPending {
+        if wasPending {
+            if wasSelected {
+                selectedPreset = nil
+            }
+            applyPreset(.automatic)
+        } else if wasSelected &&
+                    pendingPreset == nil &&
+                    !safetyRecoveryPending &&
+                    safetyRecoveryTask == nil {
             selectedPreset = nil
             applyPreset(.automatic)
+        } else if wasSelected {
+            // A different verified transition is already in flight. Do not
+            // cancel the user's newer choice merely because the old preset was
+            // removed from Settings.
+            selectedPreset = nil
         }
     }
 
@@ -4189,7 +4268,13 @@ final class FanCtlMenuBarModel: NSObject {
             return
         }
 
-        let wasSelectedOrPending = selectedPreset == .custom(id) || pendingPreset == .custom(id)
+        let customPreset = FanPreset.custom(id)
+        let shouldReapply = Self.shouldReapplyUpdatedUserPreset(
+            customPreset,
+            selectedPreset: selectedPreset,
+            pendingPreset: pendingPreset,
+            safetyRecoveryPending: safetyRecoveryPending || safetyRecoveryTask != nil
+        )
         let previousRPM = userPresets[index].rpm
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let updatedPreset = UserFanPreset(
@@ -4198,9 +4283,24 @@ final class FanCtlMenuBarModel: NSObject {
             rpm: max(validUserRPMRange.lowerBound, min(validUserRPMRange.upperBound, rpm))
         )
         userPresets[index] = updatedPreset
-        if wasSelectedOrPending, updatedPreset.rpm != previousRPM {
-            applyPreset(.custom(id))
+        if shouldReapply, updatedPreset.rpm != previousRPM {
+            applyPreset(customPreset)
         }
+    }
+
+    static func shouldReapplyUpdatedUserPreset(
+        _ preset: FanPreset,
+        selectedPreset: FanPreset?,
+        pendingPreset: FanPreset?,
+        safetyRecoveryPending: Bool
+    ) -> Bool {
+        guard !safetyRecoveryPending else {
+            return false
+        }
+        if let pendingPreset {
+            return pendingPreset == preset
+        }
+        return selectedPreset == preset
     }
 
     func updateMenuBarTitleFormat(_ format: String) {
@@ -4366,6 +4466,30 @@ final class FanCtlMenuBarModel: NSObject {
     }
 
     private func applyPreset(_ preset: FanPreset) {
+        switch Self.pendingPresetRequestDisposition(
+            requestedPreset: preset,
+            pendingPreset: pendingPreset
+        ) {
+        case .start:
+            if preset == .automatic {
+                deferredPreset = nil
+            }
+        case .deferLatest:
+                // Settings edits can arrive while a helper mutation is already
+                // in flight. Keep only the latest desired preset instead of
+                // queuing every intermediate RPM behind an uncancellable XPC.
+                deferredPreset = preset
+                return
+        case .ignore:
+            // An explicit Automatic transition is authoritative. Settings
+            // edits still persist their values, but cannot queue a return to
+            // manual mode behind that safety request.
+            return
+        }
+        if pendingPreset == nil {
+            deferredPreset = nil
+        }
+
         automaticRecoveryNoticePending = false
         safetyRecoveryPending = false
         safetyRecoveryTask?.cancel()
@@ -4382,7 +4506,7 @@ final class FanCtlMenuBarModel: NSObject {
         let mutationSequence = FanCtlHelperClient.nextMutationSequence()
         pendingPreset = preset
         controlTask?.cancel()
-        setNotice(L10n.applyingFanPreset, source: .control)
+        setNotice(nil, source: .control)
         setNotice(nil, source: .lease)
         setNotice(nil, source: .mode)
 
@@ -4392,6 +4516,7 @@ final class FanCtlMenuBarModel: NSObject {
             }
             var didAttemptMutation = false
             defer {
+                let shouldApplyDeferredPreset = generation == controlGeneration
                 if generation == controlGeneration {
                     pendingPreset = nil
                     controlTask = nil
@@ -4400,6 +4525,9 @@ final class FanCtlMenuBarModel: NSObject {
                     // A stale local generation does not cancel a mutation that
                     // was already delivered to the privileged helper.
                     refreshControlState()
+                }
+                if shouldApplyDeferredPreset {
+                    applyDeferredPresetIfNeeded()
                 }
             }
             do {
@@ -4461,6 +4589,33 @@ final class FanCtlMenuBarModel: NSObject {
             }
 
         }
+    }
+
+    static func pendingPresetRequestDisposition(
+        requestedPreset: FanPreset,
+        pendingPreset: FanPreset?
+    ) -> PendingPresetRequestDisposition {
+        guard let pendingPreset else {
+            return .start
+        }
+        if pendingPreset == .automatic {
+            return .ignore
+        }
+        if requestedPreset == .automatic {
+            return .start
+        }
+        return .deferLatest
+    }
+
+    private func applyDeferredPresetIfNeeded() {
+        guard pendingPreset == nil,
+              safetyRecoveryTask == nil,
+              !safetyRecoveryPending,
+              let deferredPreset else {
+            return
+        }
+        self.deferredPreset = nil
+        applyPreset(deferredPreset)
     }
 
     @objc private func manualLeaseTimerDidFire() {
@@ -4665,6 +4820,7 @@ final class FanCtlMenuBarModel: NSObject {
         let generation = controlGeneration
         let mutationSequence = FanCtlHelperClient.nextMutationSequence()
         pendingPreset = nil
+        deferredPreset = nil
         controlTask?.cancel()
         controlTask = nil
         stopManualControlMaintenance()

@@ -3,7 +3,32 @@ import FanCtlHelperXPC
 import Darwin
 import Dispatch
 import Foundation
+import OSLog
 import Security
+
+private let helperLogger = Logger(
+    subsystem: FanCtlHelperConstants.helperBundleIdentifier,
+    category: "control"
+)
+
+private final class MutationWork: @unchecked Sendable {
+    let sequence: Int64
+    let kind: FanCtlMutationKind
+    let operation: (Int64) throws -> String
+    let reply: (NSString?, NSString?) -> Void
+
+    init(
+        sequence: Int64,
+        kind: FanCtlMutationKind,
+        operation: @escaping (Int64) throws -> String,
+        reply: @escaping (NSString?, NSString?) -> Void
+    ) {
+        self.sequence = sequence
+        self.kind = kind
+        self.operation = operation
+        self.reply = reply
+    }
+}
 
 private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unchecked Sendable {
     private static let fastAutomaticRecoveryAttempts = 3
@@ -12,6 +37,11 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
     private static let startupAutomaticRecoveryDelay: TimeInterval = 1
 
     private let mutationLock = NSLock()
+    private let supersessionTracker = FanCtlMutationSupersessionTracker()
+    private let mutationQueue = DispatchQueue(
+        label: "\(FanCtlHelperConstants.machServiceName).mutations",
+        qos: .userInitiated
+    )
     private let watchdogQueue = DispatchQueue(
         label: "\(FanCtlHelperConstants.machServiceName).manual-lease"
     )
@@ -21,7 +51,7 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
     private var automaticRecoveryPending = true
     private var automaticRecoveryAttempts = 0
     private var nextAutomaticRecoveryAttempt = DispatchTime.now()
-    private var highestMutationSequence = Int64.min
+    private var smcConnection: SMCConnection?
 
     override init() {
         super.init()
@@ -55,18 +85,18 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
         _ sequence: NSNumber,
         withReply reply: @escaping (NSString?, NSString?) -> Void
     ) {
-        completeMutation(sequence: sequence, reply) {
-            try renewManualControlLease()
+        completeMutation(sequence: sequence, kind: .leaseRenewal, reply) { _ in
+            try self.renewManualControlLease()
             return "manual lease renewed"
         }
     }
 
     func setAutomatic(_ sequence: NSNumber, withReply reply: @escaping (NSString?, NSString?) -> Void) {
-        completeMutation(sequence: sequence, reply) {
+        completeMutation(sequence: sequence, kind: .automaticControl, reply) { _ in
             do {
-                try setAutomatic()
+                try self.setAutomatic()
             } catch {
-                scheduleAutomaticRecoveryAfterFailedAttempt()
+                self.scheduleAutomaticRecoveryAfterFailedAttempt()
                 throw error
             }
             return "automatic"
@@ -74,8 +104,10 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
     }
 
     func setMaximum(_ sequence: NSNumber, withReply reply: @escaping (NSString?, NSString?) -> Void) {
-        completeMutation(sequence: sequence, reply) {
-            try setMaximum()
+        completeMutation(sequence: sequence, kind: .manualControl, reply) { sequence in
+            try self.setMaximum {
+                self.supersessionTracker.isSuperseded(sequence, kind: .manualControl)
+            }
             return "maximum"
         }
     }
@@ -85,9 +117,11 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
         sequence: NSNumber,
         withReply reply: @escaping (NSString?, NSString?) -> Void
     ) {
-        completeMutation(sequence: sequence, reply) {
-            let value = try validatedRPM(rpm)
-            try setRPM(Double(value))
+        completeMutation(sequence: sequence, kind: .manualControl, reply) { sequence in
+            let value = try self.validatedRPM(rpm)
+            try self.setRPM(Double(value)) {
+                self.supersessionTracker.isSuperseded(sequence, kind: .manualControl)
+            }
             return "rpm \(value)"
         }
     }
@@ -96,18 +130,18 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
         _ sequence: NSNumber,
         withReply reply: @escaping (NSString?, NSString?) -> Void
     ) {
-        completeMutation(sequence: sequence, reply) {
+        completeMutation(sequence: sequence, kind: .maintenance, reply) { _ in
             do {
                 guard LegacyManualHelperInstall.isPresent else {
                     return "legacy helper absent"
                 }
-                try setAutomatic()
+                try self.setAutomatic()
                 try LegacyManualHelperInstall.remove {
-                    try setAutomatic()
+                    try self.setAutomatic()
                 }
                 return "legacy helper removed"
             } catch {
-                scheduleAutomaticRecoveryAfterFailedAttempt()
+                self.scheduleAutomaticRecoveryAfterFailedAttempt()
                 throw error
             }
         }
@@ -115,30 +149,83 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
 
     private func completeMutation(
         sequence: NSNumber,
+        kind: FanCtlMutationKind,
         _ reply: @escaping (NSString?, NSString?) -> Void,
-        operation: () throws -> String
+        operation: @escaping (Int64) throws -> String
     ) {
-        mutationLock.lock()
-        let result = Result {
-            let validatedSequence = try validateMutationSequence(sequence)
-            guard validatedSequence > highestMutationSequence else {
-                throw FanCtlHelperError.staleMutationSequence(
-                    received: validatedSequence,
-                    latest: highestMutationSequence
+        let validatedSequence: Int64
+        do {
+            validatedSequence = try validateMutationSequence(sequence)
+        } catch {
+            replyFailure(error, reply: reply)
+            return
+        }
+        supersessionTracker.submit(validatedSequence, kind: kind)
+        let work = MutationWork(
+            sequence: validatedSequence,
+            kind: kind,
+            operation: operation,
+            reply: reply
+        )
+        mutationQueue.async { [weak self] in
+            guard let self else {
+                work.reply(
+                    nil,
+                    FanCtlHelperWire.encodeFailure(
+                        code: "internal_error",
+                        message: "The fan helper service is no longer available."
+                    ) as NSString
+                )
+                return
+            }
+
+            mutationLock.lock()
+            let result = Result {
+                let latestForKind = supersessionTracker.latestSequence(for: work.kind)
+                guard supersessionTracker.claimForExecution(
+                    work.sequence,
+                    kind: work.kind
+                ) else {
+                    throw FanCtlHelperError.staleMutationSequence(
+                        received: work.sequence,
+                        latest: latestForKind
+                    )
+                }
+                return try work.operation(work.sequence)
+            }
+            mutationLock.unlock()
+
+            switch result {
+            case .success(let response):
+                work.reply(response as NSString, nil)
+            case .failure(let error):
+                let failure = wireFailure(for: error)
+                helperLogger.error(
+                    "Command failed [\(failure.code, privacy: .public)]: \(failure.message, privacy: .public)"
+                )
+                work.reply(
+                    nil,
+                    FanCtlHelperWire.encodeFailure(
+                        code: failure.code,
+                        message: failure.message
+                    ) as NSString
                 )
             }
-            highestMutationSequence = validatedSequence
-            return try operation()
         }
-        mutationLock.unlock()
+    }
 
-        switch result {
-        case .success(let response):
-            reply(response as NSString, nil)
-        case .failure(let error):
-            let failure = wireFailure(for: error)
-            reply(nil, FanCtlHelperWire.encodeFailure(code: failure.code, message: failure.message) as NSString)
-        }
+    private func replyFailure(
+        _ error: Error,
+        reply: (NSString?, NSString?) -> Void
+    ) {
+        let failure = wireFailure(for: error)
+        reply(
+            nil,
+            FanCtlHelperWire.encodeFailure(
+                code: failure.code,
+                message: failure.message
+            ) as NSString
+        )
     }
 
     private func validateMutationSequence(_ sequence: NSNumber) throws -> Int64 {
@@ -186,7 +273,8 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
         let now = DispatchTime.now()
         guard let currentDeadline = manualLeaseDeadline,
               currentDeadline.uptimeNanoseconds > now.uptimeNanoseconds,
-              !automaticRecoveryPending else {
+              !automaticRecoveryPending,
+              smcConnection != nil else {
             if manualLeaseDeadline != nil {
                 manualLeaseDeadline = nil
                 automaticRecoveryPending = true
@@ -340,92 +428,169 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
     }
 
     private func setAutomatic() throws {
-        let smc = try SMCConnection()
-        let fanCount = try requiredFanCount(smc: smc)
-        let controller = FanController(smc: smc)
-        var failures: [String] = []
-
-        // Automatic is the safety state, so continue attempting every fan even when
-        // one fan fails. The batch API preserves per-fan failure details.
+        let transactionStart = DispatchTime.now().uptimeNanoseconds
         do {
-            try controller.setAutomatic()
+            let smc = try retainedSMCConnection()
+            let fanCount = try requiredFanCount(smc: smc)
+            let controller = FanController(smc: smc)
+            var failures: [String] = []
+
+            // Automatic is the safety state, so continue attempting every fan even when
+            // one fan fails. The batch API preserves per-fan failure details.
+            do {
+                try controller.setAutomatic()
+            } catch {
+                failures.append(error.localizedDescription)
+            }
+
+            let verificationFailures = automaticVerificationFailures(
+                smc: smc,
+                expectedFanCount: fanCount
+            )
+            guard verificationFailures.isEmpty else {
+                failures.append(contentsOf: verificationFailures)
+                throw FanCtlHelperError.incompleteOperation(
+                    operation: "set automatic",
+                    failures: failures
+                )
+            }
+            clearManualControlLease()
+            releaseSMCConnection(smc)
+            let elapsed = elapsedSeconds(since: transactionStart)
+            helperLogger.info(
+                "Automatic transaction succeeded fans=\(fanCount, privacy: .public) elapsed=\(elapsed, format: .fixed(precision: 3), privacy: .public)s"
+            )
         } catch {
-            failures.append(error.localizedDescription)
+            smcConnection = nil
+            throw error
         }
-
-        let verificationFailures = automaticVerificationFailures(
-            smc: smc,
-            expectedFanCount: fanCount
-        )
-        guard verificationFailures.isEmpty else {
-            failures.append(contentsOf: verificationFailures)
-            throw FanCtlHelperError.incompleteOperation(operation: "set automatic", failures: failures)
-        }
-        clearManualControlLease()
     }
 
-    private func setMaximum() throws {
-        let smc = try SMCConnection()
-        let fans = try enumerateFansForManualControl(smc: smc)
-        try applyManualTransaction(smc: smc, fans: fans) { fan in
-            guard let maximumRPM = fan.maximumRPM else {
-                throw FanCtlHelperError.invalidFanConfiguration(
-                    fanIndex: fan.index,
-                    detail: "maximum RPM was not preflighted"
-                )
+    private func setMaximum(
+        cancellationRequested: @escaping @Sendable () -> Bool
+    ) throws {
+        let smc = try retainedSMCConnection()
+        do {
+            let fans = try enumerateFansForManualControl(smc: smc)
+            try applyManualTransaction(
+                smc: smc,
+                fans: fans,
+                cancellationRequested: cancellationRequested
+            ) { fan in
+                guard let maximumRPM = fan.maximumRPM else {
+                    throw FanCtlHelperError.invalidFanConfiguration(
+                        fanIndex: fan.index,
+                        detail: "maximum RPM was not preflighted"
+                    )
+                }
+                return maximumRPM
             }
-            return maximumRPM
+            armManualControlLease()
+        } catch {
+            releaseSMCConnection(smc)
+            throw error
         }
-        armManualControlLease()
     }
 
-    private func setRPM(_ rpm: Double) throws {
-        let smc = try SMCConnection()
-        let fans = try enumerateFansForManualControl(smc: smc)
-        for fan in fans {
-            guard let minimumRPM = fan.minimumRPM,
-                  let maximumRPM = fan.maximumRPM else {
-                throw FanCtlHelperError.invalidFanConfiguration(
-                    fanIndex: fan.index,
-                    detail: "RPM range was not preflighted"
-                )
+    private func setRPM(
+        _ rpm: Double,
+        cancellationRequested: @escaping @Sendable () -> Bool
+    ) throws {
+        let smc = try retainedSMCConnection()
+        do {
+            let fans = try enumerateFansForManualControl(smc: smc)
+            for fan in fans {
+                guard let minimumRPM = fan.minimumRPM,
+                      let maximumRPM = fan.maximumRPM else {
+                    throw FanCtlHelperError.invalidFanConfiguration(
+                        fanIndex: fan.index,
+                        detail: "RPM range was not preflighted"
+                    )
+                }
+                guard (minimumRPM...maximumRPM).contains(rpm) else {
+                    throw FanCtlHelperError.rpmOutsideFanRange(
+                        requested: rpm,
+                        fanIndex: fan.index,
+                        minimum: minimumRPM,
+                        maximum: maximumRPM
+                    )
+                }
             }
-            guard (minimumRPM...maximumRPM).contains(rpm) else {
-                throw FanCtlHelperError.rpmOutsideFanRange(
-                    requested: rpm,
-                    fanIndex: fan.index,
-                    minimum: minimumRPM,
-                    maximum: maximumRPM
-                )
+            try applyManualTransaction(
+                smc: smc,
+                fans: fans,
+                cancellationRequested: cancellationRequested
+            ) { _ in rpm }
+            armManualControlLease()
+        } catch {
+            releaseSMCConnection(smc)
+            throw error
+        }
+    }
+
+    private func retainedSMCConnection() throws -> SMCConnection {
+        if let existingConnection = smcConnection {
+            do {
+                // IOKit user clients can become stale across sleep or an SMC
+                // service restart. Validate only when a real control command
+                // arrives so lease heartbeats remain I/O-free.
+                _ = try existingConnection.read("FNum")
+                return existingConnection
+            } catch {
+                guard smcConnectionRecoveryDisposition(for: error) == .reopenConnection else {
+                    throw error
+                }
+                smcConnection = nil
             }
         }
-        try applyManualTransaction(smc: smc, fans: fans) { _ in rpm }
-        armManualControlLease()
+        let connection = try SMCConnection()
+        smcConnection = connection
+        return connection
+    }
+
+    private func releaseSMCConnection(_ connection: SMCConnection) {
+        if smcConnection === connection {
+            smcConnection = nil
+        }
     }
 
     private func applyManualTransaction(
         smc: SMCConnection,
         fans: [ControllableFan],
+        cancellationRequested: @escaping @Sendable () -> Bool,
         requestedRPM: (ControllableFan) throws -> Double
     ) throws {
-        let controller = FanController(smc: smc)
+        let controller = FanController(
+            smc: smc,
+            cancellationRequested: cancellationRequested
+        )
         var expectedTargets: [Int: Double] = [:]
+        let transactionStart = DispatchTime.now().uptimeNanoseconds
 
         do {
             for fan in fans {
                 let result: FanControlResult
+                let fanStart = DispatchTime.now().uptimeNanoseconds
                 do {
                     result = try controller.setManual(
                         fanIndex: fan.index,
                         rpm: requestedRPM(fan)
                     )
                 } catch {
+                    let elapsed = elapsedSeconds(since: fanStart)
+                    helperLogger.error(
+                        "Manual phase failed fan=\(fan.index, privacy: .public) elapsed=\(elapsed, format: .fixed(precision: 3), privacy: .public)s: \(error.localizedDescription, privacy: .public)"
+                    )
                     throw FanCtlHelperError.fanOperationFailed(
                         operation: "set manual RPM",
                         fanIndex: fan.index,
                         detail: error.localizedDescription
                     )
                 }
+                let elapsed = elapsedSeconds(since: fanStart)
+                helperLogger.info(
+                    "Manual phase succeeded fan=\(fan.index, privacy: .public) strategy=\(String(describing: result.strategy), privacy: .public) elapsed=\(elapsed, format: .fixed(precision: 3), privacy: .public)s"
+                )
                 expectedTargets[fan.index] = result.appliedRPM
             }
 
@@ -440,8 +605,28 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
                     failures: verificationFailures
                 )
             }
+            let elapsed = elapsedSeconds(since: transactionStart)
+            helperLogger.info(
+                "Manual transaction succeeded fans=\(fans.count, privacy: .public) elapsed=\(elapsed, format: .fixed(precision: 3), privacy: .public)s"
+            )
         } catch {
-            let recoveryFailures = recoverAutomatic(controller: controller, smc: smc, fans: fans)
+            var recoveryFailures = recoverAutomatic(
+                controller: controller,
+                smc: smc,
+                fans: fans
+            )
+            if !recoveryFailures.isEmpty {
+                let freshConnectionFailures = recoverAutomaticUsingFreshConnection(
+                    expectedFanCount: fans.count
+                )
+                if freshConnectionFailures.isEmpty {
+                    recoveryFailures = []
+                } else {
+                    recoveryFailures.append(
+                        contentsOf: freshConnectionFailures.map { "fresh connection: \($0)" }
+                    )
+                }
+            }
             guard recoveryFailures.isEmpty else {
                 scheduleAutomaticRecoveryAfterFailedAttempt()
                 throw FanCtlHelperError.automaticRecoveryFailed(
@@ -454,11 +639,23 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
         }
     }
 
+    private func elapsedSeconds(since start: UInt64) -> Double {
+        Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000_000
+    }
+
     private func recoverAutomatic(
         controller: FanController,
         smc: SMCConnection,
         fans: [ControllableFan]
     ) -> [String] {
+        let initialVerificationFailures = automaticVerificationFailures(
+            smc: smc,
+            expectedFanCount: fans.count
+        )
+        guard !initialVerificationFailures.isEmpty else {
+            return []
+        }
+
         var failures: [String] = []
         do {
             try controller.setAutomatic()
@@ -474,6 +671,41 @@ private final class FanCtlHelperService: NSObject, FanCtlHelperXPCProtocol, @unc
         }
         failures.append(contentsOf: verificationFailures)
         return failures
+    }
+
+    private func recoverAutomaticUsingFreshConnection(
+        expectedFanCount: Int
+    ) -> [String] {
+        smcConnection = nil
+        do {
+            let freshConnection = try SMCConnection()
+            smcConnection = freshConnection
+            let actualFanCount = try requiredFanCount(smc: freshConnection)
+            guard actualFanCount == expectedFanCount else {
+                return ["fan count changed from \(expectedFanCount) to \(actualFanCount)"]
+            }
+
+            let controller = FanController(smc: freshConnection)
+            var failures: [String] = []
+            do {
+                try controller.setAutomatic()
+            } catch {
+                failures.append(error.localizedDescription)
+            }
+            let verificationFailures = automaticVerificationFailures(
+                smc: freshConnection,
+                expectedFanCount: expectedFanCount
+            )
+            guard !verificationFailures.isEmpty else {
+                releaseSMCConnection(freshConnection)
+                return []
+            }
+            failures.append(contentsOf: verificationFailures)
+            return failures
+        } catch {
+            smcConnection = nil
+            return [error.localizedDescription]
+        }
     }
 
     private func requiredFanCount(smc: SMCConnection) throws -> Int {

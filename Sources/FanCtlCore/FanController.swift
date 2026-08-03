@@ -83,6 +83,7 @@ public enum FanControlError: Error, LocalizedError, Sendable {
     case targetVerificationFailed(fanIndex: Int, expected: Double, actual: Double)
     case automaticBatchFailed(failures: [String])
     case rollbackFailed(originalError: String, rollbackError: String)
+    case operationSuperseded
 
     public var errorDescription: String? {
         switch self {
@@ -106,6 +107,8 @@ public enum FanControlError: Error, LocalizedError, Sendable {
             "Restoring automatic fan control failed: \(failures.joined(separator: "; "))."
         case .rollbackFailed(let originalError, let rollbackError):
             "Fan control failed (\(originalError)), and restoring the previous safe state also failed (\(rollbackError))."
+        case .operationSuperseded:
+            "The fan control operation was superseded by a newer request."
         }
     }
 }
@@ -180,21 +183,25 @@ struct FanControlTiming: Sendable {
     }
 
     static let production = FanControlTiming(
-        // Keep the previous firmware-compatibility windows while using
-        // exponentially fewer wakeups than fixed 50/100 ms polling.
-        forceTestWriteAttempts: 14,
+        // Enabling Ftst normally acknowledges quickly. Clearing it can lag
+        // behind the per-fan mode transition on Apple Silicon, so Automatic
+        // gets a separate bounded settle window below.
+        forceTestWriteAttempts: 40,
         forceTestWriteDelay: 0.05,
-        forceTestActivationDelay: 0,
-        manualModeWriteAttempts: 24,
+        forceTestActivationDelay: 0.5,
+        manualModeWriteAttempts: 150,
         manualModeWriteDelay: 0.1,
-        targetWriteAttempts: 8,
+        targetWriteAttempts: 20,
         targetWriteDelay: 0.05,
         automaticModeWriteAttempts: 12,
         automaticModeWriteDelay: 0.05,
-        forceTestClearAttempts: 8,
-        forceTestClearDelay: 0.05,
-        maximumRetryDuration: 12,
-        maximumRetryDelay: 0.5
+        forceTestClearAttempts: 50,
+        forceTestClearDelay: 0.1,
+        // This is a failure deadline, not a fixed delay. Successful mode
+        // writes return immediately; transient firmware rejections can retry
+        // for the full bounded window.
+        maximumRetryDuration: 15,
+        maximumRetryDelay: 0.1
     )
 
     static let immediate = FanControlTiming(
@@ -214,7 +221,9 @@ struct FanControlTiming: Sendable {
     )
 }
 
-public final class FanController: Sendable {
+// Every public operation is serialized by `controlLock`, including the
+// transaction-local Ftst state below.
+public final class FanController: @unchecked Sendable {
     private struct ManualPreflight {
         let fanIndex: Int
         let modeKey: String
@@ -226,16 +235,40 @@ public final class FanController: Sendable {
 
     private let smc: any SMCClient
     private let timing: FanControlTiming
+    private let cancellationRequested: @Sendable () -> Bool
     private let controlLock = NSRecursiveLock()
 
     public init(smc: any SMCClient) {
         self.smc = smc
         self.timing = .production
+        self.cancellationRequested = { false }
     }
 
-    init(smc: any SMCClient, timing: FanControlTiming) {
+    public init(
+        smc: any SMCClient,
+        cancellationRequested: @escaping @Sendable () -> Bool
+    ) {
+        self.smc = smc
+        self.timing = .production
+        self.cancellationRequested = cancellationRequested
+    }
+
+    convenience init(smc: any SMCClient, timing: FanControlTiming) {
+        self.init(
+            smc: smc,
+            timing: timing,
+            cancellationRequested: { false }
+        )
+    }
+
+    init(
+        smc: any SMCClient,
+        timing: FanControlTiming,
+        cancellationRequested: @escaping @Sendable () -> Bool
+    ) {
         self.smc = smc
         self.timing = timing
+        self.cancellationRequested = cancellationRequested
     }
 
     public convenience init() throws {
@@ -273,7 +306,7 @@ public final class FanController: Sendable {
     public func setManual(fanIndex: Int, rpm requestedRPM: Double) throws -> FanControlResult {
         controlLock.lock()
         defer { controlLock.unlock() }
-        let operationDeadline = retryDeadline()
+        try throwIfCancellationRequested()
 
         guard requestedRPM.isFinite, requestedRPM >= 0 else {
             throw FanControlError.invalidRPM(requestedRPM)
@@ -309,13 +342,14 @@ public final class FanController: Sendable {
         do {
             let strategy = try enableManualMode(
                 preflight: preflight,
-                deadline: operationDeadline
+                deadline: retryDeadline()
             )
+            try throwIfCancellationRequested()
             let verifiedRPM = try writeRPMWithRetry(
                 preflight: preflight,
                 rpm: appliedRPM,
                 targetValue: targetValue,
-                deadline: operationDeadline
+                deadline: targetRetryDeadline()
             )
 
             return FanControlResult(
@@ -347,7 +381,7 @@ public final class FanController: Sendable {
     public func setAutomatic(fanIndex: Int) throws {
         controlLock.lock()
         defer { controlLock.unlock() }
-        let operationDeadline = retryDeadline()
+        let modeDeadline = retryDeadline()
 
         try validateFanIndex(fanIndex)
         let resolved = try resolveFanMode(fanIndex: fanIndex)
@@ -355,7 +389,7 @@ public final class FanController: Sendable {
             fanIndex: fanIndex,
             modeKey: resolved.key,
             modeValue: resolved.value,
-            deadline: operationDeadline
+            deadline: modeDeadline
         )
     }
 
@@ -365,7 +399,7 @@ public final class FanController: Sendable {
         controlLock.lock()
         defer { controlLock.unlock() }
 
-        let operationDeadline = retryDeadline()
+        let modeDeadline = retryDeadline()
         let count = try fanCount()
         guard count > 0 else {
             throw FanControlError.invalidFanCount(Double(count))
@@ -380,7 +414,7 @@ public final class FanController: Sendable {
                         fanIndex: fanIndex,
                         modeKey: resolved.key,
                         reference: resolved.value,
-                        deadline: operationDeadline
+                        deadline: modeDeadline
                     )
                 }
             } catch {
@@ -393,7 +427,7 @@ public final class FanController: Sendable {
             // system-controlled mode. Re-check the complete set and clear Ftst
             // only when that is demonstrably safe.
             do {
-                if try clearForceTestModeWhenSafe(deadline: operationDeadline) {
+                if try clearForceTestModeWhenSafe(deadline: forceTestClearRetryDeadline()) {
                     return
                 }
             } catch {
@@ -405,7 +439,7 @@ public final class FanController: Sendable {
         do {
             try clearForceTestModeAfterBatch(
                 fanCount: count,
-                deadline: operationDeadline
+                deadline: forceTestClearRetryDeadline()
             )
         } catch {
             throw FanControlError.automaticBatchFailed(
@@ -425,27 +459,55 @@ public final class FanController: Sendable {
         preflight: ManualPreflight,
         deadline: UInt64
     ) throws -> FanControlStrategy {
+        try throwIfCancellationRequested()
         if preflight.initialMode == .manual {
             return .directModeWrite
         }
 
         var directWriteError: Error?
-        do {
-            try writeInteger(1, key: preflight.modeKey, reference: preflight.modeValue)
-            let observed = try readMode(key: preflight.modeKey)
-            guard observed == .manual else {
-                throw FanControlError.modeVerificationFailed(
+        let directWriteAttempts = 3
+        for attempt in 0..<directWriteAttempts {
+            try throwIfCancellationRequested()
+            do {
+                try writeInteger(1, key: preflight.modeKey, reference: preflight.modeValue)
+                // A successful write can lead its readback by a few hundred
+                // milliseconds. Wait briefly before deciding it was ignored;
+                // this keeps later fans on the direct fast path without
+                // trusting an acknowledged-but-unapplied write indefinitely.
+                if try waitForManualModeReadback(
+                    fanIndex: preflight.fanIndex,
+                    modeKey: preflight.modeKey
+                ) {
+                    return .directModeWrite
+                }
+                directWriteError = FanControlError.modeVerificationFailed(
                     fanIndex: preflight.fanIndex,
                     expected: "manual (raw mode 1)",
-                    actual: observed.rawValue
+                    actual: preflight.initialMode.rawValue
                 )
+                break
+            } catch {
+                if let observed = try? readMode(key: preflight.modeKey), observed == .manual {
+                    return .directModeWrite
+                }
+                directWriteError = error
+                if let code = firmwareResultCode(error), code == 0x80 || code == 0x81 {
+                    guard waitBeforeRetry(
+                        after: attempt,
+                        maxAttempts: directWriteAttempts,
+                        initialDelay: 0.05,
+                        maximumDelay: min(0.05, timing.maximumRetryDelay),
+                        deadline: deadline
+                    ) else {
+                        break
+                    }
+                    continue
+                }
+                break
             }
-            return .directModeWrite
-        } catch {
-            guard isManualUnlockCandidate(error) else {
-                throw error
-            }
-            directWriteError = error
+        }
+        if let directWriteError, !isManualUnlockCandidate(directWriteError) {
+            throw directWriteError
         }
 
         guard let forceTestValue = try readOptionalValue("Ftst") else {
@@ -456,30 +518,50 @@ public final class FanController: Sendable {
             )
         }
 
-        if try integerValue(forceTestValue, key: "Ftst") != 1 {
-            try writeIntegerWithRetry(
-                1,
-                key: "Ftst",
-                reference: forceTestValue,
-                maxAttempts: timing.forceTestWriteAttempts,
-                delay: timing.forceTestWriteDelay,
-                deadline: deadline
-            )
-            if timing.forceTestActivationDelay > 0 {
-                waitForActivation(
-                    timing.forceTestActivationDelay,
-                    deadline: deadline
-                )
+        var modeDeadline = deadline
+        if try integerValue(forceTestValue, key: "Ftst") == 1 {
+            // Ftst=1 inherited from an earlier command is not necessarily an
+            // active hand-off when every fan is already system controlled.
+            // Normalize that stale state to zero before creating a fresh edge.
+            // If another fan is manual, clearing is unsafe and this returns
+            // false; the same-value Ftst reassert below refreshes the unlock.
+            if try clearForceTestModeWhenSafe(deadline: forceTestClearRetryDeadline()) {
+                modeDeadline = retryDeadline()
             }
         }
 
+        // The reference M3/M4 sequence reasserts Ftst whenever a direct mode
+        // write is rejected, even if Ftst already reads as one. This avoids
+        // carrying an expired diagnostic hand-off from another fan/request.
+        try writeIntegerWithRetry(
+            1,
+            key: "Ftst",
+            reference: forceTestValue,
+            maxAttempts: timing.forceTestWriteAttempts,
+            delay: timing.forceTestWriteDelay,
+            acceptsMatchingReadbackAfterWriteError: false,
+            checksCancellation: true,
+            deadline: modeDeadline
+        )
+        try throwIfCancellationRequested()
+        if timing.forceTestActivationDelay > 0 {
+            waitForActivation(
+                timing.forceTestActivationDelay,
+                deadline: deadline
+            )
+        }
+
+        // Ftst activation and the per-fan firmware hand-off are separate
+        // phases. Give the mode transition its complete bounded window only
+        // after thermalmonitord has had the activation grace period.
+        modeDeadline = retryDeadline()
         try writeModeWithRetry(
             fanIndex: preflight.fanIndex,
             modeKey: preflight.modeKey,
             reference: preflight.modeValue,
             maxAttempts: timing.manualModeWriteAttempts,
             delay: timing.manualModeWriteDelay,
-            deadline: deadline
+            deadline: modeDeadline
         )
         return .forceTestUnlock
     }
@@ -490,6 +572,7 @@ public final class FanController: Sendable {
                 preflight: preflight,
                 rpm: preflight.initialTargetRPM,
                 targetValue: preflight.targetValue,
+                checksCancellation: false,
                 deadline: deadline
             )
             let mode = try readMode(key: preflight.modeKey)
@@ -527,7 +610,7 @@ public final class FanController: Sendable {
             )
         }
 
-        _ = try clearForceTestModeWhenSafe(deadline: deadline)
+        _ = try clearForceTestModeWhenSafe(deadline: forceTestClearRetryDeadline())
 
         observed = try readMode(key: modeKey)
         guard observed.isSystemControlled else {
@@ -561,6 +644,7 @@ public final class FanController: Sendable {
             reference: forceTestValue,
             maxAttempts: timing.forceTestClearAttempts,
             delay: timing.forceTestClearDelay,
+            acknowledgedWriteSettleAttempts: forceTestClearSettlePollAttempts(),
             deadline: deadline
         )
 
@@ -583,6 +667,7 @@ public final class FanController: Sendable {
                 reference: forceTestValue,
                 maxAttempts: timing.forceTestClearAttempts,
                 delay: timing.forceTestClearDelay,
+                acknowledgedWriteSettleAttempts: forceTestClearSettlePollAttempts(),
                 deadline: deadline
             )
         }
@@ -595,74 +680,187 @@ public final class FanController: Sendable {
 
     private func writeRPM(fanIndex: Int, rpm: Double, targetValue: SMCValue) throws {
         let targetKey = "F\(fanIndex)Tg"
-        try smc.write(targetKey, bytes: encodeRPM(rpm, for: targetValue))
+        try smc.write(
+            targetKey,
+            bytes: encodeRPM(rpm, for: targetValue),
+            expectedDataSize: targetValue.dataSize
+        )
     }
 
     private func writeRPMWithRetry(
         preflight: ManualPreflight,
         rpm: Double,
         targetValue: SMCValue,
+        checksCancellation: Bool = true,
         deadline: UInt64
     ) throws -> Double {
+        if checksCancellation {
+            try throwIfCancellationRequested()
+        }
         let targetKey = "F\(preflight.fanIndex)Tg"
-        var lastError: Error?
 
+        var needsWrite = true
+        var lastWriteError: Error?
+        var lastObservedRPM: Double?
+        var lastReadError: Error?
+        let reassertAttempt = timing.targetWriteAttempts >= 8
+            ? (timing.targetWriteAttempts * 3) / 4
+            : nil
         for attempt in 0..<timing.targetWriteAttempts {
-            let modeBeforeWrite = try readMode(key: preflight.modeKey)
-            guard modeBeforeWrite == .manual else {
-                throw FanControlError.modeVerificationFailed(
-                    fanIndex: preflight.fanIndex,
-                    expected: "manual while applying target RPM (raw mode 1)",
-                    actual: modeBeforeWrite.rawValue
-                )
+            if checksCancellation {
+                try throwIfCancellationRequested()
+            }
+            var wroteThisAttempt = false
+
+            if needsWrite {
+                do {
+                    if checksCancellation {
+                        try throwIfCancellationRequested()
+                    }
+                    wroteThisAttempt = true
+                    try writeRPM(
+                        fanIndex: preflight.fanIndex,
+                        rpm: rpm,
+                        targetValue: targetValue
+                    )
+                    needsWrite = false
+                    lastWriteError = nil
+                } catch FanControlError.operationSuperseded {
+                    throw FanControlError.operationSuperseded
+                } catch {
+                    if let observed = try? readNumeric(targetKey), speedsMatch(observed, rpm) {
+                        return try verifyManualModeAfterTarget(
+                            preflight: preflight,
+                            verifiedRPM: observed,
+                            checksCancellation: checksCancellation
+                        )
+                    }
+                    guard isRetryableTargetWriteFailure(error) else {
+                        throw error
+                    }
+                    lastWriteError = error
+                    // 0x87 can report failure after the target was committed;
+                    // give it read-only settle time. The other transient codes
+                    // mean the write should be retried on the next attempt.
+                    needsWrite = firmwareResultCode(error) != 0x87
+                }
             }
 
             do {
-                try writeRPM(
-                    fanIndex: preflight.fanIndex,
-                    rpm: rpm,
-                    targetValue: targetValue
-                )
-                let verifiedRPM = try readNumeric(targetKey)
-                guard speedsMatch(verifiedRPM, rpm) else {
-                    throw FanControlError.targetVerificationFailed(
-                        fanIndex: preflight.fanIndex,
-                        expected: rpm,
-                        actual: verifiedRPM
+                let observedRPM = try readNumeric(targetKey)
+                lastObservedRPM = observedRPM
+                lastReadError = nil
+                if speedsMatch(observedRPM, rpm) {
+                    return try verifyManualModeAfterTarget(
+                        preflight: preflight,
+                        verifiedRPM: observedRPM,
+                        checksCancellation: checksCancellation
                     )
                 }
-
-                let modeAfterWrite = try readMode(key: preflight.modeKey)
-                guard modeAfterWrite == .manual else {
-                    throw FanControlError.modeVerificationFailed(
-                        fanIndex: preflight.fanIndex,
-                        expected: "manual after applying target RPM (raw mode 1)",
-                        actual: modeAfterWrite.rawValue
-                    )
-                }
-                return verifiedRPM
             } catch {
-                guard isTargetVerificationFailure(error) else {
+                guard isTransientReadbackFailure(error) else {
                     throw error
                 }
-                lastError = error
+                lastReadError = error
+            }
+
+            // An acknowledged target write normally only needs readback time.
+            // Allow a long poll-only grace period, then re-assert at most once
+            // so an ignored write can recover without continually restarting a
+            // firmware-side pending update.
+            if !needsWrite,
+               !wroteThisAttempt,
+               let reassertAttempt,
+                attempt == reassertAttempt {
+                do {
+                    if checksCancellation {
+                        try throwIfCancellationRequested()
+                    }
+                    try writeRPM(
+                        fanIndex: preflight.fanIndex,
+                        rpm: rpm,
+                        targetValue: targetValue
+                    )
+                    lastWriteError = nil
+                } catch FanControlError.operationSuperseded {
+                    throw FanControlError.operationSuperseded
+                } catch {
+                    if let observed = try? readNumeric(targetKey), speedsMatch(observed, rpm) {
+                        return try verifyManualModeAfterTarget(
+                            preflight: preflight,
+                            verifiedRPM: observed,
+                            checksCancellation: checksCancellation
+                        )
+                    }
+                    guard isRetryableTargetWriteFailure(error) else {
+                        throw error
+                    }
+                    lastWriteError = error
+                    needsWrite = firmwareResultCode(error) != 0x87
+                }
             }
 
             guard waitBeforeRetry(
                 after: attempt,
                 maxAttempts: timing.targetWriteAttempts,
                 initialDelay: timing.targetWriteDelay,
+                maximumDelay: timing.targetWriteDelay,
                 deadline: deadline
             ) else {
                 break
             }
         }
 
-        throw lastError ?? FanControlError.targetVerificationFailed(
+        let finalMode = try readMode(key: preflight.modeKey)
+        guard finalMode == .manual else {
+            throw FanControlError.modeVerificationFailed(
+                fanIndex: preflight.fanIndex,
+                expected: "manual after applying target RPM (raw mode 1)",
+                actual: finalMode.rawValue
+            )
+        }
+        if lastObservedRPM == nil, let lastReadError {
+            throw lastReadError
+        }
+        if let lastWriteError {
+            throw lastWriteError
+        }
+        throw FanControlError.targetVerificationFailed(
             fanIndex: preflight.fanIndex,
             expected: rpm,
-            actual: .nan
+            actual: lastObservedRPM ?? .nan
         )
+    }
+
+    private func verifyManualModeAfterTarget(
+        preflight: ManualPreflight,
+        verifiedRPM: Double,
+        checksCancellation: Bool
+    ) throws -> Double {
+        // The mode readback can trail a successful mode/target write. Keep
+        // final verification strict, but give that readback a short bounded
+        // window rather than restarting the entire Ftst unlock sequence.
+        let deadline = retryDeadline(maximumDuration: 1)
+        var lastMode = ObservedFanMode.unknown(-1)
+        while true {
+            if checksCancellation {
+                try throwIfCancellationRequested()
+            }
+            lastMode = try readMode(key: preflight.modeKey)
+            if lastMode == .manual {
+                return verifiedRPM
+            }
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard now < deadline else {
+                throw FanControlError.modeVerificationFailed(
+                    fanIndex: preflight.fanIndex,
+                    expected: "manual after applying target RPM (raw mode 1)",
+                    actual: lastMode.rawValue
+                )
+            }
+            let remaining = TimeInterval(deadline - now) / 1_000_000_000
+            Thread.sleep(forTimeInterval: min(0.05, remaining))
+        }
     }
 
     private func encodeRPM(_ rpm: Double, for target: SMCValue) throws -> [UInt8] {
@@ -744,7 +942,11 @@ public final class FanController: Sendable {
     }
 
     private func writeInteger(_ rawValue: Int, key: String, reference: SMCValue) throws {
-        try smc.write(key, bytes: try encodeInteger(rawValue, key: key, reference: reference))
+        try smc.write(
+            key,
+            bytes: try encodeInteger(rawValue, key: key, reference: reference),
+            expectedDataSize: reference.dataSize
+        )
     }
 
     private func encodeInteger(_ rawValue: Int, key: String, reference: SMCValue) throws -> [UInt8] {
@@ -784,31 +986,101 @@ public final class FanController: Sendable {
         reference: SMCValue,
         maxAttempts: Int,
         delay: TimeInterval,
+        acceptsMatchingReadbackAfterWriteError: Bool = true,
+        reassertsAcknowledgedWrite: Bool = true,
+        acknowledgedWriteSettleAttempts: Int? = nil,
+        checksCancellation: Bool = false,
         deadline: UInt64
     ) throws {
+        let defaultSettlePollAttempts = maxAttempts <= 2 ? 1 : 3
+        let settlePollAttempts = max(
+            1,
+            min(maxAttempts, acknowledgedWriteSettleAttempts ?? defaultSettlePollAttempts)
+        )
+        var needsWrite = true
+        var nextReassertAttempt: Int?
         var lastError: Error?
         for attempt in 0..<maxAttempts {
-            do {
-                try writeInteger(rawValue, key: key, reference: reference)
-                let verified = try integerValue(smc.read(key), key: key)
-                guard verified == rawValue else {
-                    throw FanControlError.valueVerificationFailed(
-                        key: key,
-                        expected: rawValue,
-                        actual: verified
-                    )
+            if checksCancellation {
+                try throwIfCancellationRequested()
+            }
+            if needsWrite {
+                do {
+                    try writeInteger(rawValue, key: key, reference: reference)
+                    needsWrite = false
+                    nextReassertAttempt = attempt + settlePollAttempts
+                    lastError = nil
+                } catch {
+                    if acceptsMatchingReadbackAfterWriteError,
+                       let verified = try? integerValue(smc.read(key), key: key),
+                       verified == rawValue {
+                        return
+                    }
+                    guard isRetryableForceTestWriteFailure(error) else {
+                        throw error
+                    }
+                    lastError = error
+                    guard waitBeforeRetry(
+                        after: attempt,
+                        maxAttempts: maxAttempts,
+                        initialDelay: delay,
+                        maximumDelay: delay,
+                        deadline: deadline
+                    ) else {
+                        break
+                    }
+                    continue
                 }
-                return
+            }
+
+            do {
+                let verified = try integerValue(smc.read(key), key: key)
+                if verified == rawValue {
+                    return
+                }
+                lastError = FanControlError.valueVerificationFailed(
+                    key: key,
+                    expected: rawValue,
+                    actual: verified
+                )
             } catch {
-                guard isValueVerificationFailure(error) else {
+                guard isTransientReadbackFailure(error) else {
                     throw error
                 }
                 lastError = error
+            }
+
+            // Verify before reasserting an acknowledged write. Some firmware
+            // publishes the new value only after several reads; writing first
+            // at this boundary can restart that pending transition forever.
+            if reassertsAcknowledgedWrite,
+               !needsWrite,
+               let reassertAt = nextReassertAttempt,
+               attempt >= reassertAt {
+                do {
+                    if checksCancellation {
+                        try throwIfCancellationRequested()
+                    }
+                    try writeInteger(rawValue, key: key, reference: reference)
+                    nextReassertAttempt = attempt + settlePollAttempts
+                } catch {
+                    if acceptsMatchingReadbackAfterWriteError,
+                       let verified = try? integerValue(smc.read(key), key: key),
+                       verified == rawValue {
+                        return
+                    }
+                    guard isRetryableForceTestWriteFailure(error) else {
+                        throw error
+                    }
+                    needsWrite = true
+                    lastError = error
+                }
             }
             guard waitBeforeRetry(
                 after: attempt,
                 maxAttempts: maxAttempts,
                 initialDelay: delay,
+                maximumDelay: delay,
                 deadline: deadline
             ) else {
                 break
@@ -827,19 +1099,26 @@ public final class FanController: Sendable {
     ) throws {
         var lastError: Error?
         for attempt in 0..<maxAttempts {
+            try throwIfCancellationRequested()
             do {
                 try writeInteger(1, key: modeKey, reference: reference)
-                let observed = try readMode(key: modeKey)
-                guard observed == .manual else {
-                    throw FanControlError.modeVerificationFailed(
-                        fanIndex: fanIndex,
-                        expected: "manual (raw mode 1)",
-                        actual: observed.rawValue
-                    )
+                if try waitForManualModeReadback(
+                    fanIndex: fanIndex,
+                    modeKey: modeKey
+                ) {
+                    return
                 }
-                return
+                lastError = FanControlError.modeVerificationFailed(
+                    fanIndex: fanIndex,
+                    expected: "manual (raw mode 1)",
+                    actual: -1
+                )
             } catch {
-                guard isModeVerificationFailure(error) else {
+                if let observed = try? readMode(key: modeKey), observed == .manual {
+                    return
+                }
+                guard isRetryableModeTransitionFailure(error) ||
+                        isTransientReadbackFailure(error) else {
                     throw error
                 }
                 lastError = error
@@ -848,6 +1127,7 @@ public final class FanController: Sendable {
                 after: attempt,
                 maxAttempts: maxAttempts,
                 initialDelay: delay,
+                maximumDelay: delay,
                 deadline: deadline
             ) else {
                 break
@@ -860,35 +1140,115 @@ public final class FanController: Sendable {
         )
     }
 
+    private func waitForManualModeReadback(
+        fanIndex: Int,
+        modeKey: String
+    ) throws -> Bool {
+        // Zero-delay test timings remain deterministic. Production gives a
+        // successful SMC write up to 500 ms to appear before reasserting it.
+        let settleDuration = timing.manualModeWriteDelay > 0
+            ? min(0.5, timing.maximumRetryDuration)
+            : 0
+        let deadline = retryDeadline(maximumDuration: settleDuration)
+
+        while true {
+            try throwIfCancellationRequested()
+            do {
+                if try readMode(key: modeKey) == .manual {
+                    return true
+                }
+            } catch {
+                guard isTransientReadbackFailure(error) else {
+                    throw error
+                }
+            }
+
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard settleDuration > 0, now < deadline else {
+                return false
+            }
+            let remaining = TimeInterval(deadline - now) / 1_000_000_000
+            Thread.sleep(forTimeInterval: min(0.05, remaining))
+        }
+    }
+
     private func writeSystemModeWithRetry(
         fanIndex: Int,
         modeKey: String,
         reference: SMCValue,
         deadline: UInt64
     ) throws -> ObservedFanMode {
+        let settlePollAttempts = timing.automaticModeWriteAttempts <= 2 ? 1 : 3
+        var needsWrite = true
+        var nextReassertAttempt: Int?
         var lastError: Error?
         for attempt in 0..<timing.automaticModeWriteAttempts {
-            do {
-                try writeInteger(0, key: modeKey, reference: reference)
-                let observed = try readMode(key: modeKey)
-                guard observed.isSystemControlled else {
-                    throw FanControlError.modeVerificationFailed(
-                        fanIndex: fanIndex,
-                        expected: "automatic or system-managed (raw mode 0 or 3)",
-                        actual: observed.rawValue
-                    )
+            if needsWrite {
+                do {
+                    try writeInteger(0, key: modeKey, reference: reference)
+                    needsWrite = false
+                    nextReassertAttempt = attempt + settlePollAttempts
+                    lastError = nil
+                } catch {
+                    if let observed = try? readMode(key: modeKey), observed.isSystemControlled {
+                        return observed
+                    }
+                    guard isRetryableModeTransitionFailure(error) else {
+                        throw error
+                    }
+                    lastError = error
+                    guard waitBeforeRetry(
+                        after: attempt,
+                        maxAttempts: timing.automaticModeWriteAttempts,
+                        initialDelay: timing.automaticModeWriteDelay,
+                        maximumDelay: timing.automaticModeWriteDelay,
+                        deadline: deadline
+                    ) else {
+                        break
+                    }
+                    continue
                 }
-                return observed
+            }
+
+            do {
+                let observed = try readMode(key: modeKey)
+                if observed.isSystemControlled {
+                    return observed
+                }
+                lastError = FanControlError.modeVerificationFailed(
+                    fanIndex: fanIndex,
+                    expected: "automatic or system-managed (raw mode 0 or 3)",
+                    actual: observed.rawValue
+                )
             } catch {
-                guard isModeVerificationFailure(error) else {
+                guard isTransientReadbackFailure(error) else {
                     throw error
                 }
                 lastError = error
+            }
+
+            if !needsWrite,
+               let reassertAt = nextReassertAttempt,
+               attempt >= reassertAt {
+                do {
+                    try writeInteger(0, key: modeKey, reference: reference)
+                    nextReassertAttempt = attempt + settlePollAttempts
+                } catch {
+                    if let observed = try? readMode(key: modeKey), observed.isSystemControlled {
+                        return observed
+                    }
+                    guard isRetryableModeTransitionFailure(error) else {
+                        throw error
+                    }
+                    needsWrite = true
+                    lastError = error
+                }
             }
             guard waitBeforeRetry(
                 after: attempt,
                 maxAttempts: timing.automaticModeWriteAttempts,
                 initialDelay: timing.automaticModeWriteDelay,
+                maximumDelay: timing.automaticModeWriteDelay,
                 deadline: deadline
             ) else {
                 break
@@ -928,14 +1288,21 @@ public final class FanController: Sendable {
                         ))
                     }
                 } catch {
-                    if isModeVerificationFailure(error),
-                       let verificationFailure = error as? FanControlError {
-                        verificationFailures.append(verificationFailure)
-                    } else {
-                        nonRetryableFailures.append(
-                            "fan \(fanIndex): \(error.localizedDescription)"
-                        )
+                    if let resolved = try? resolveFanMode(fanIndex: fanIndex),
+                       resolved.mode.isSystemControlled {
+                        continue
                     }
+                    if isRetryableModeTransitionFailure(error) {
+                        verificationFailures.append(FanControlError.modeVerificationFailed(
+                            fanIndex: fanIndex,
+                            expected: "automatic or system-managed after clearing Ftst",
+                            actual: -1
+                        ))
+                        continue
+                    }
+                    nonRetryableFailures.append(
+                        "fan \(fanIndex): \(error.localizedDescription)"
+                    )
                 }
             }
 
@@ -959,6 +1326,7 @@ public final class FanController: Sendable {
                 after: attempt,
                 maxAttempts: timing.automaticModeWriteAttempts,
                 initialDelay: timing.automaticModeWriteDelay,
+                maximumDelay: timing.automaticModeWriteDelay,
                 deadline: deadline
             ) else {
                 break
@@ -987,33 +1355,95 @@ public final class FanController: Sendable {
         if isModeVerificationFailure(error) {
             return true
         }
-        if case SMCError.firmwareRejected = error {
+        if let code = firmwareResultCode(error) {
             // Some firmware reports a rejected direct mode write instead of
-            // silently retaining Automatic. Ftst is the supported fallback
-            // strategy for that state; the rejected write itself is not retried.
-            return true
+            // silently retaining Automatic. Only the observed transient/unlock
+            // results justify changing Ftst; structural key/size/access errors
+            // must fail without entering diagnostic mode.
+            return code == 0x82 || code == 0x85
         }
         return false
     }
 
-    private func isValueVerificationFailure(_ error: Error) -> Bool {
-        guard case FanControlError.valueVerificationFailed = error else {
-            return false
+    private func firmwareResultCode(_ error: Error) -> UInt8? {
+        guard case SMCError.firmwareRejected(_, let code) = error else {
+            return nil
         }
-        return true
+        return code
     }
 
-    private func isTargetVerificationFailure(_ error: Error) -> Bool {
-        guard case FanControlError.targetVerificationFailed = error else {
+    private func throwIfCancellationRequested() throws {
+        if cancellationRequested() {
+            throw FanControlError.operationSuperseded
+        }
+    }
+
+    private func isRetryableForceTestWriteFailure(_ error: Error) -> Bool {
+        guard let code = firmwareResultCode(error) else {
             return false
         }
-        return true
+        // Communication collision/spurious-data results can clear on retry.
+        // Bad command/parameter, missing, read-only, write-only and size errors
+        // describe a persistent request problem for Ftst.
+        return code == 0x80 || code == 0x81
+    }
+
+    private func isRetryableModeTransitionFailure(_ error: Error) -> Bool {
+        guard let code = firmwareResultCode(error) else {
+            return false
+        }
+        // 0x82 is the observed M3/M4 response while thermalmonitord is yielding
+        // control after Ftst. Other structural/access errors are not retried.
+        return code == 0x80 || code == 0x81 || code == 0x82
+    }
+
+    private func isRetryableTargetWriteFailure(_ error: Error) -> Bool {
+        guard let code = firmwareResultCode(error) else {
+            return false
+        }
+        // 0x87 has been observed on Apple Silicon target writes whose values
+        // were nevertheless committed. 0x82 can briefly occur at the end of
+        // the manual-mode handoff; collision/spurious results are transient.
+        return code == 0x80 || code == 0x81 || code == 0x82 || code == 0x87
+    }
+
+    private func isTransientReadbackFailure(_ error: Error) -> Bool {
+        guard let code = firmwareResultCode(error) else {
+            return false
+        }
+        return code == 0x80 || code == 0x81
     }
 
     private func retryDeadline(maximumDuration: TimeInterval? = nil) -> UInt64 {
         let duration = maximumDuration ?? timing.maximumRetryDuration
         let nanoseconds = UInt64(duration * 1_000_000_000)
         return DispatchTime.now().uptimeNanoseconds &+ nanoseconds
+    }
+
+    private func targetRetryDeadline() -> UInt64 {
+        let pollingWindow = timing.targetWriteDelay *
+            Double(max(0, timing.targetWriteAttempts - 1)) + 0.1
+        return retryDeadline(
+            maximumDuration: min(timing.maximumRetryDuration, pollingWindow)
+        )
+    }
+
+    private func forceTestClearRetryDeadline() -> UInt64 {
+        let pollingWindow = timing.forceTestClearDelay *
+            Double(max(0, timing.forceTestClearAttempts - 1)) + 0.1
+        return retryDeadline(
+            maximumDuration: min(timing.maximumRetryDuration, max(1, pollingWindow))
+        )
+    }
+
+    private func forceTestClearSettlePollAttempts() -> Int {
+        // Leave most of the clear window read-only so an acknowledged firmware
+        // transition can settle. Still permit a few sparse reassertions when a
+        // successful SMC write was actually ignored.
+        if timing.forceTestClearAttempts <= 2 {
+            return 1
+        }
+        return max(3, timing.forceTestClearAttempts / 3)
     }
 
     private func waitForActivation(_ delay: TimeInterval, deadline: UInt64) {
@@ -1029,6 +1459,7 @@ public final class FanController: Sendable {
         after attempt: Int,
         maxAttempts: Int,
         initialDelay: TimeInterval,
+        maximumDelay: TimeInterval? = nil,
         deadline: UInt64
     ) -> Bool {
         guard attempt < maxAttempts - 1 else {
@@ -1046,7 +1477,7 @@ public final class FanController: Sendable {
 
         let exponent = min(attempt, 8)
         let backoff = initialDelay * pow(2, Double(exponent))
-        let delay = min(backoff, timing.maximumRetryDelay)
+        let delay = min(backoff, maximumDelay ?? timing.maximumRetryDelay)
         let remaining = TimeInterval(deadline - now) / 1_000_000_000
         Thread.sleep(forTimeInterval: min(delay, remaining))
         return DispatchTime.now().uptimeNanoseconds < deadline

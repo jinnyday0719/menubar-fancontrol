@@ -62,6 +62,76 @@ final class FanControllerRetryTests: XCTestCase {
         XCTAssertEqual(smc.writeCount(for: "F0Md"), 2)
     }
 
+    func testDirectModeWriteAcceptsAppliedValueAfterReportedError() throws {
+        let smc = RetryTestSMCClient(values: oneFanValues(mode: 0, forceTest: 0))
+        smc.applyThenFailWriteKey = "F0Md"
+
+        let result = try FanController(smc: smc, timing: .immediate)
+            .setManual(fanIndex: 0, rpm: 5_000)
+
+        XCTAssertEqual(result.strategy, .directModeWrite)
+        XCTAssertEqual(smc.writeCount(for: "F0Md"), 1)
+        XCTAssertEqual(smc.writeCount(for: "Ftst"), 0)
+    }
+
+    func testSupersededManualTransitionStopsBeforeTargetWrite() {
+        let smc = RetryTestSMCClient(values: oneFanValues(mode: 0, forceTest: 0))
+        smc.rejectManualModeUntilForceTest = true
+        smc.ignoredWriteKey = "F0Md"
+        let timing = FanControlTiming(
+            forceTestWriteAttempts: 2,
+            forceTestWriteDelay: 0,
+            forceTestActivationDelay: 0,
+            manualModeWriteAttempts: 20,
+            manualModeWriteDelay: 0,
+            targetWriteAttempts: 2,
+            targetWriteDelay: 0,
+            maximumRetryDuration: 1,
+            maximumRetryDelay: 0
+        )
+        let controller = FanController(
+            smc: smc,
+            timing: timing,
+            cancellationRequested: {
+                smc.writeCount(for: "F0Md") >= 3
+            }
+        )
+
+        XCTAssertThrowsError(
+            try controller.setManual(fanIndex: 0, rpm: 5_000)
+        ) { error in
+            guard case FanControlError.operationSuperseded = error else {
+                return XCTFail("Expected operationSuperseded, received \(error)")
+            }
+        }
+
+        XCTAssertEqual(smc.writeCount(for: "F0Md"), 3)
+        XCTAssertEqual(smc.writeCount(for: "F0Tg"), 0)
+    }
+
+    func testSupersededWarmTransitionRestoresPreviousManualTarget() {
+        let smc = RetryTestSMCClient(values: oneFanValues(mode: 1, forceTest: 1))
+        let controller = FanController(
+            smc: smc,
+            timing: .immediate,
+            cancellationRequested: {
+                smc.readCount(for: "F0Md") >= 1
+            }
+        )
+
+        XCTAssertThrowsError(
+            try controller.setManual(fanIndex: 0, rpm: 5_000)
+        ) { error in
+            guard case FanControlError.operationSuperseded = error else {
+                return XCTFail("Expected operationSuperseded, received \(error)")
+            }
+        }
+
+        XCTAssertEqual(smc.writeCount(for: "F0Tg"), 1)
+        XCTAssertEqual(smc.numericValue(for: "F0Tg"), 2_000)
+        XCTAssertEqual(smc.numericValue(for: "F0Md"), 1)
+    }
+
     func testBatchAutomaticUsesSingleFanCountPreflight() throws {
         let values = twoFanValues(mode: 1, forceTest: 1)
         let smc = RetryTestSMCClient(values: values)
@@ -133,6 +203,18 @@ final class FanControllerRetryTests: XCTestCase {
         XCTAssertEqual(smc.writeCount(for: "Ftst"), 1)
         XCTAssertEqual(smc.writeCount(for: "F0Md"), 1)
         XCTAssertEqual(smc.writeCount(for: "F1Md"), 1)
+    }
+
+    func testPostForceTestVerificationAcceptsAppliedModeAfterReportedError() throws {
+        let smc = RetryTestSMCClient(values: oneFanValues(mode: 0, forceTest: 1))
+        smc.modesAfterForceTestClear = ["F0Md": 1]
+        smc.applyThenFailWriteKey = "F0Md"
+
+        try FanController(smc: smc, timing: .immediate).setAutomatic()
+
+        XCTAssertEqual(smc.writeCount(for: "Ftst"), 1)
+        XCTAssertEqual(smc.writeCount(for: "F0Md"), 1)
+        XCTAssertEqual(smc.numericValue(for: "F0Md"), 0)
     }
 }
 

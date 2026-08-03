@@ -515,7 +515,7 @@ enum FanCtlHelperInstaller {
         case .replace:
             try await unregister(service)
             clearStoredRegistration()
-            try register(service)
+            try await registerAfterReplacement(service)
         case .awaitApproval:
             throw InstallError.requiresApproval
         }
@@ -575,6 +575,47 @@ enum FanCtlHelperInstaller {
         @unknown default:
             rememberRegisteredFingerprint(currentFingerprint)
         }
+    }
+
+    private static func registerAfterReplacement(_ service: SMAppService) async throws {
+        // On current macOS releases the unregister completion handler can run
+        // before smd is ready to accept the replacement. An immediate register
+        // then fails with SMAppServiceErrorDomain Code 1 even though retrying a
+        // moment later succeeds. Keep this workaround scoped to replacement;
+        // a first-time install still reports real errors immediately.
+        let retryDelays: [UInt64] = [
+            250_000_000,
+            500_000_000,
+            1_000_000_000,
+            2_000_000_000
+        ]
+        var lastError: Swift.Error?
+
+        for delay in retryDelays {
+            try Task.checkCancellation()
+            try await Task.sleep(nanoseconds: delay)
+            do {
+                try register(service)
+                return
+            } catch InstallError.requiresApproval {
+                throw InstallError.requiresApproval
+            } catch {
+                guard isTransientReplacementRegistrationError(error),
+                      serviceStatus == .inactive else {
+                    throw error
+                }
+                lastError = error
+            }
+        }
+
+        throw lastError ?? InstallError.registrationDidNotStart
+    }
+
+    private static func isTransientReplacementRegistrationError(
+        _ error: Swift.Error
+    ) -> Bool {
+        let error = error as NSError
+        return error.domain == "SMAppServiceErrorDomain" && error.code == 1
     }
 
     private static let currentFingerprint: String? = {
